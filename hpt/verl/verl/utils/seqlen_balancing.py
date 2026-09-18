@@ -468,6 +468,42 @@ def rearrange_micro_batches(
     return micro_batches, micro_bsz_idx
 
 
+def rearrange_micro_batches_hpt_legacy(batch, max_token_len, dp_group=None):
+    """Reproduce the verl 0.1 HPT actor's dynamic micro-batch partition.
+
+    The legacy path derives the number of partitions from the sum of valid
+    attention tokens, then balances those same linear sequence lengths with
+    Karmarkar-Karp. It intentionally does not use the 0.9 transformer-workload
+    cost or its subsequent micro-batch ordering heuristic.
+    """
+    attention_mask = batch["attention_mask"]
+    seq_len_effective = attention_mask.sum(dim=1)
+    # The migrated recipe has a wider dense response buffer (8192 vs 4096 in
+    # the reference). It is not part of the legacy packing cost, so validate
+    # the longest real sequence rather than rejecting short rows solely for
+    # their 0.9 storage width.
+    max_seq_len = seq_len_effective.max()
+    assert max_token_len >= max_seq_len, (
+        f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
+    )
+
+    num_micro_batches = ceildiv(seq_len_effective.sum().item(), max_token_len)
+    if dist.is_initialized():
+        num_micro_batches_tensor = torch.tensor([num_micro_batches], device=get_device_name())
+        dist.all_reduce(num_micro_batches_tensor, op=dist.ReduceOp.MAX, group=dp_group)
+        num_micro_batches = num_micro_batches_tensor.cpu().item()
+
+    seq_len_effective = seq_len_effective.tolist()
+    assert num_micro_batches <= len(seq_len_effective)
+    micro_bsz_idx = get_seqlen_balanced_partitions(
+        seq_len_effective,
+        num_micro_batches,
+        equal_size=False,
+    )
+    micro_batches = [tu.index_select_tensor_dict(batch, partition) for partition in micro_bsz_idx]
+    return micro_batches, micro_bsz_idx
+
+
 def get_reverse_idx(idx_map):
     """
     Build the inverse of an index mapping.

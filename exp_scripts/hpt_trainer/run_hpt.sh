@@ -45,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.optim.lr="${LR}" \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
   actor_rollout_ref.actor.policy_loss.loss_mode=hpt \
   actor_rollout_ref.actor.policy_loss.loss_remove_clip=true \
   actor_rollout_ref.actor.policy_loss.loss_remove_token_mean=true \

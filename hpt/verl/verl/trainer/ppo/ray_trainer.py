@@ -1371,6 +1371,7 @@ class RayPPOTrainer:
             compute_loss=True,
             valid_mask_key="hpt_valid_mask" if hpt_enabled else None,
             allow_partial_mini_batch=hpt_enabled,
+            hpt_legacy_dynamic_batching=hpt_enabled,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")

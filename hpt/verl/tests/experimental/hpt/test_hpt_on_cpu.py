@@ -20,6 +20,8 @@ from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward, _global_ppo_mini_batch_size
 from verl.utils import tensordict_utils as tu
+from verl.utils.seqlen_balancing import rearrange_micro_batches_hpt_legacy
+from verl.workers.engine.utils import prepare_micro_batches
 from verl.workers.engine_workers import _select_valid_rows
 
 
@@ -388,6 +390,7 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
                     "mini_batch_size": tu.get(data, "mini_batch_size"),
                     "valid_mask_key": tu.get(data, "valid_mask_key"),
                     "allow_partial": tu.get(data, "allow_partial_mini_batch"),
+                    "legacy_packing": tu.get(data, "hpt_legacy_dynamic_batching"),
                 }
             )
             return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": {"mfu": 0.0}})
@@ -399,8 +402,20 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
         trainer._update_actor(batch)
 
     assert captured == [
-        {"rows": 2, "mini_batch_size": 256, "valid_mask_key": "hpt_valid_mask", "allow_partial": True},
-        {"rows": 4, "mini_batch_size": 256, "valid_mask_key": "hpt_valid_mask", "allow_partial": True},
+        {
+            "rows": 2,
+            "mini_batch_size": 256,
+            "valid_mask_key": "hpt_valid_mask",
+            "allow_partial": True,
+            "legacy_packing": True,
+        },
+        {
+            "rows": 4,
+            "mini_batch_size": 256,
+            "valid_mask_key": "hpt_valid_mask",
+            "allow_partial": True,
+            "legacy_packing": True,
+        },
     ]
 
 
@@ -426,6 +441,69 @@ def test_hpt_padding_is_removed_before_partial_mini_batch_split():
     assert [len(mini_batch) for mini_batch in mini_batches] == [128, 2]
     assert torch.equal(mini_batches[0]["row_id"], torch.arange(128))
     assert torch.equal(mini_batches[1]["row_id"], torch.arange(128, 130))
+
+
+def _partition_batch(lengths, valid_mask=None):
+    width = 10
+    attention_mask = torch.zeros(len(lengths), width, dtype=torch.long)
+    for row, length in enumerate(lengths):
+        attention_mask[row, :length] = 1
+    if valid_mask is None:
+        valid_mask = torch.ones(len(lengths), dtype=torch.bool)
+    return TensorDict(
+        {
+            "input_ids": torch.arange(width).repeat(len(lengths), 1),
+            "attention_mask": attention_mask,
+            "row_id": torch.arange(len(lengths)),
+            "hpt_valid_mask": valid_mask,
+        },
+        batch_size=[len(lengths)],
+    )
+
+
+def test_hpt_dynamic_micro_batch_partitions_match_legacy_reference_cases():
+    cases = [
+        ([5, 5, 5, 5], None, [[0, 3], [1, 2]]),
+        ([2, 9, 3, 8, 4], None, [[0, 2, 4], [1], [3]]),
+        ([4, 6, 5, 5], None, [[2, 3], [0, 1]]),
+        ([5, 6], None, [[1], [0]]),
+        ([4, 4, 4], None, [[0, 1], [2]]),
+        ([3, 3, 10, 2], None, [[2], [0, 1, 3]]),
+        ([6, 9, 4, 5], None, [[2, 3], [1], [0]]),
+        ([6, 4, 10, 5], [True, True, False, True], [[1, 2], [0]]),
+        ([8, 2, 4, 9, 3], None, [[1, 2, 4], [3], [0]]),
+    ]
+    for lengths, valid_mask, expected in cases:
+        mask = None if valid_mask is None else torch.tensor(valid_mask, dtype=torch.bool)
+        batch = _select_valid_rows(_partition_batch(lengths, mask), "hpt_valid_mask")
+        _, partitions = rearrange_micro_batches_hpt_legacy(batch, max_token_len=10)
+        assert partitions == expected
+
+
+def test_prepare_micro_batches_selects_legacy_partition_only_when_flagged():
+    data = _partition_batch([2, 9, 3, 8, 4])
+    tu.assign_non_tensor(
+        data,
+        use_dynamic_bsz=True,
+        max_token_len_per_gpu=10,
+        sp_size=1,
+        hpt_legacy_dynamic_batching=True,
+    )
+    data = next(
+        tu.make_iterator(
+            _select_valid_rows(data, "hpt_valid_mask"),
+            mini_batch_size=5,
+            epochs=1,
+            dataloader_kwargs={"shuffle": False},
+        )
+    )
+    _, hpt_partitions = prepare_micro_batches(data, same_micro_num_in_dp=False)
+    assert hpt_partitions == [[0, 2, 4], [1], [3]]
+
+    stock_data = data.clone()
+    tu.assign_non_tensor(stock_data, hpt_legacy_dynamic_batching=False)
+    _, stock_partitions = prepare_micro_batches(stock_data, same_micro_num_in_dp=False)
+    assert stock_partitions != hpt_partitions
 
 
 def test_switch_replaces_failed_group_and_masks_dp_padding():

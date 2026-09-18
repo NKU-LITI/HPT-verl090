@@ -25,7 +25,11 @@ from verl.utils.device import is_npu_available
 from verl.utils.device import manual_seed as device_manual_seed
 from verl.utils.device import manual_seed_all as device_manual_seed_all
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+from verl.utils.seqlen_balancing import (
+    rearrange_micro_batches,
+    rearrange_micro_batches_hpt_legacy,
+    restore_dynamic_batch,
+)
 
 
 def enable_full_determinism(seed: int):
@@ -109,16 +113,30 @@ def prepare_micro_batches(
         assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
         max_token_len_per_gpu = data["max_token_len_per_gpu"]
         max_token_len = max_token_len_per_gpu * sp_size
-        micro_batches, batch_idx_list = rearrange_micro_batches(
-            data,
-            max_token_len=max_token_len,
-            dp_group=dp_group,
-            num_batches_divided_by=num_batches_divided_by,
-            same_micro_num_in_dp=same_micro_num_in_dp,
-            min_num_micro_batch=min_num_micro_batch,
-            use_dynamic_bsz_balance=use_dynamic_bsz_balance,
-            force_group_size=force_group_size,
+        hpt_legacy_dynamic_batching = tu.get_non_tensor_data(
+            data=data,
+            key="hpt_legacy_dynamic_batching",
+            default=False,
         )
+        if hpt_legacy_dynamic_batching:
+            if num_batches_divided_by is not None or min_num_micro_batch is not None or force_group_size != 1:
+                raise ValueError("HPT legacy dynamic batching does not support PP/RM partition constraints")
+            micro_batches, batch_idx_list = rearrange_micro_batches_hpt_legacy(
+                data,
+                max_token_len=max_token_len,
+                dp_group=dp_group,
+            )
+        else:
+            micro_batches, batch_idx_list = rearrange_micro_batches(
+                data,
+                max_token_len=max_token_len,
+                dp_group=dp_group,
+                num_batches_divided_by=num_batches_divided_by,
+                same_micro_num_in_dp=same_micro_num_in_dp,
+                min_num_micro_batch=min_num_micro_batch,
+                use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+                force_group_size=force_group_size,
+            )
     else:
         total_data_size = len(data)
         micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
