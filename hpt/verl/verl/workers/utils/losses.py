@@ -145,9 +145,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # add entropy loss
     if entropy is not None:
-        entropy_loss = agg_loss(
-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
-        )
+        if loss_mode == "hpt":
+            # The legacy HPT actor normalized entropy inside each current
+            # micro-batch, independently of the PPO mini-batch token count.
+            from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss
+
+            entropy_loss = compute_hpt_legacy_entropy_loss(entropy, response_mask)
+        else:
+            entropy_loss = agg_loss(
+                loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+            )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)

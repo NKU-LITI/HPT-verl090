@@ -17,7 +17,7 @@ from verl import DataProto
 from verl.experimental.hpt.algorithm import apply_hpt
 from verl.experimental.hpt.dataset import _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
-from verl.experimental.hpt.loss import compute_policy_loss_hpt
+from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward, _global_ppo_mini_batch_size
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine_workers import _select_valid_rows
@@ -39,6 +39,13 @@ class _ActorConfig:
     clip_ratio_c = 3.0
     global_batch_info = {}
 
+    def __init__(self, *, remove_clip=True, remove_token_mean=True):
+        self.policy_loss = _PolicyConfig(
+            remove_clip=remove_clip,
+            remove_token_mean=remove_token_mean,
+        )
+        self.global_batch_info = {}
+
     def get(self, key, default=None):
         return getattr(self, key, default)
 
@@ -59,6 +66,228 @@ class _GRPOActorConfig(_ActorConfig):
             remove_token_mean=remove_token_mean,
         )
         self.global_batch_info = {}
+
+
+def _reference_hpt_fixed_microbatch(
+    *,
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    prefix_mask,
+    offline_mode,
+    entropy,
+    entropy_coeff=0.001,
+    sft_loss_coef=1.0,
+    off_policy_beta=0.1,
+):
+    """Executable transcription of the canonical 0.1 HPT micro-batch objective."""
+    response_mask = response_mask.bool()
+    prefix_mask = prefix_mask.bool()
+    response_width = response_mask.shape[-1]
+    target_rows = prefix_mask.any(dim=-1)
+    on_token_loss = -advantages * torch.exp(log_prob - old_log_prob)
+    zero = log_prob.sum() * 0.0
+
+    if offline_mode == 0:
+        on_mask = response_mask & (~target_rows).unsqueeze(-1)
+        on_loss = (on_token_loss * on_mask).sum() / response_width
+        target_mask = response_mask & target_rows.unsqueeze(-1)
+        sft_loss = (
+            (-log_prob * target_mask).sum() / target_mask.sum() * sft_loss_coef if target_mask.any() else zero
+        )
+        off_loss = zero
+    else:
+        probability = torch.exp(log_prob)
+        off_token_loss = -advantages * probability / (probability + off_policy_beta)
+        on_mask = response_mask & ~prefix_mask
+        off_mask = response_mask & prefix_mask
+        on_loss = (on_token_loss * on_mask).sum() / response_width
+        off_loss = (off_token_loss * off_mask).sum() / response_width
+        sft_loss = zero
+
+    pg_loss = on_loss + sft_loss + off_loss
+    entropy_loss = (entropy * response_mask).sum() / response_mask.sum()
+    total_loss = pg_loss - entropy_coeff * entropy_loss
+    return {
+        "on_policy_loss": on_loss,
+        "sft_loss": sft_loss,
+        "off_policy_loss": off_loss,
+        "pg_loss": pg_loss,
+        "entropy_loss": entropy_loss,
+        "total_loss": total_loss,
+    }
+
+
+def _hpt_objective_case(case):
+    log_prob = case["log_prob"].clone().requires_grad_()
+    config = _ActorConfig()
+    # A deliberately unrelated global denominator proves that the HPT legacy
+    # fixed-microbatch objective does not use verl 0.9 global aggregation.
+    config.global_batch_info = {
+        "dp_size": 1,
+        "batch_num_tokens": int(case["response_mask"].sum()) + 17,
+        "global_batch_size": case["response_mask"].shape[0] + 11,
+        "loss_scale_factor": None,
+    }
+    target_rows = case["prefix_mask"].any(dim=-1)
+    mode = case["offline_mode"]
+    pg_loss, metrics = compute_policy_loss_hpt(
+        old_log_prob=case["old_log_prob"],
+        log_prob=log_prob,
+        advantages=case["advantages"],
+        response_mask=case["response_mask"],
+        config=config,
+        hpt_sft_mask=target_rows,
+        hpt_valid_mask=torch.ones_like(target_rows),
+        hpt_sft_weight=torch.full_like(target_rows, case["sft_loss_coef"], dtype=torch.float32),
+        hpt_offline_mode=torch.full_like(target_rows, mode, dtype=torch.int8),
+        hpt_off_policy_beta=torch.full_like(target_rows, case["off_policy_beta"], dtype=torch.float32),
+    )
+    entropy_loss = compute_hpt_legacy_entropy_loss(case["entropy"], case["response_mask"])
+    total_loss = pg_loss - case["entropy_coeff"] * entropy_loss
+    return log_prob, {
+        "on_policy_loss": pg_loss.new_tensor(metrics["hpt/rl_loss"]),
+        "sft_loss": pg_loss.new_tensor(metrics["hpt/sft_loss"]),
+        "off_policy_loss": pg_loss.new_tensor(metrics["hpt/off_policy_loss"]),
+        "pg_loss": pg_loss,
+        "entropy_loss": entropy_loss,
+        "total_loss": total_loss,
+    }
+
+
+def _fixed_objective_cases():
+    def case(name, log_prob, old_log_prob, advantages, response_mask, prefix_mask, offline_mode):
+        log_prob = torch.tensor(log_prob, dtype=torch.float64)
+        return {
+            "name": name,
+            "log_prob": log_prob,
+            "old_log_prob": torch.tensor(old_log_prob, dtype=torch.float64),
+            "advantages": torch.tensor(advantages, dtype=torch.float64),
+            "response_mask": torch.tensor(response_mask, dtype=torch.bool),
+            "prefix_mask": torch.tensor(prefix_mask, dtype=torch.bool),
+            "whether_off": torch.tensor([offline_mode == 1] * len(log_prob), dtype=torch.bool),
+            "offline_mode": offline_mode,
+            "entropy": torch.arange(1, log_prob.numel() + 1, dtype=torch.float64).reshape_as(log_prob) / 10,
+            "entropy_coeff": 0.001,
+            "sft_loss_coef": 0.7,
+            "off_policy_beta": 0.1,
+        }
+
+    return [
+        case(
+            "A_pure_on_policy",
+            [[-0.2, -0.4, -0.8], [-1.1, -0.7, -2.0]],
+            [[-0.21, -0.39, -0.8], [-1.12, -0.72, -2.0]],
+            [[1.0, -0.5, 0.0], [-1.0, 0.3, 0.0]],
+            [[1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0]],
+            0,
+        ),
+        case(
+            "B_pure_sft",
+            [[-1.0, -2.0, -4.0], [-0.4, -0.8, -1.2]],
+            [[-1.0, -2.0, -4.0], [-0.4, -0.8, -1.2]],
+            [[0, 0, 0], [0, 0, 0]],
+            [[1, 1, 0], [1, 1, 1]],
+            [[1, 1, 0], [1, 1, 1]],
+            0,
+        ),
+        case(
+            "C_mixed_rl_sft",
+            [[-0.1, -0.3, -2.0], [-1.0, -1.5, -3.0], [-0.7, -2.0, -2.0]],
+            [[-0.2, -0.2, -2.0], [-1.0, -1.5, -3.0], [-0.8, -2.0, -2.0]],
+            [[1.0, -1.0, 0], [0, 0, 0], [-0.5, 0, 0]],
+            [[1, 1, 0], [1, 1, 0], [1, 0, 0]],
+            [[0, 0, 0], [1, 1, 0], [0, 0, 0]],
+            0,
+        ),
+        case(
+            "D_pure_off_policy",
+            [[-0.4, -1.0, -2.0], [-0.7, -1.4, -2.1]],
+            [[-0.5, -1.1, -2.0], [-0.8, -1.3, -2.1]],
+            [[1.0, -0.5, 0], [-1.0, 0.25, 0]],
+            [[1, 1, 0], [1, 1, 0]],
+            [[1, 1, 0], [1, 1, 0]],
+            1,
+        ),
+        case(
+            "E_mixed_on_off",
+            [[-0.2, -0.9, -2.0], [-0.5, -1.2, -2.0]],
+            [[-0.25, -0.8, -2.0], [-0.55, -1.1, -2.0]],
+            [[1.0, -0.5, 0], [-1.0, 0.75, 0]],
+            [[1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [1, 1, 0]],
+            1,
+        ),
+        case(
+            "F_variable_lengths",
+            [[-0.3, -0.6, -0.9, -1.2], [-0.4, -0.8, -1.6, -2.0], [-0.2, -2.0, -2.0, -2.0]],
+            [[-0.35, -0.65, -0.95, -1.2], [-0.45, -0.75, -1.5, -2.0], [-0.25, -2.0, -2.0, -2.0]],
+            [[1, 1, -1, 0], [-1, 0.5, 0.25, 0], [0.5, 0, 0, 0]],
+            [[1, 1, 1, 0], [1, 1, 1, 1], [1, 0, 0, 0]],
+            [[0, 0, 0, 0], [1, 1, 1, 1], [0, 0, 0, 0]],
+            1,
+        ),
+        case(
+            "G_ratio_near_one",
+            [[-0.500001, -0.999999], [-1.500002, -0.299998]],
+            [[-0.5, -1.0], [-1.5, -0.3]],
+            [[1, -1], [0.5, -0.25]],
+            [[1, 1], [1, 1]],
+            [[0, 0], [0, 0]],
+            0,
+        ),
+        case(
+            "H_ratio_outside_clip",
+            [[1.0, -4.0, -0.2], [-3.0, 0.8, -2.0]],
+            [[-1.0, -1.0, -0.2], [-1.0, -1.0, -2.0]],
+            [[1.0, 1.0, 0], [-1.0, -1.0, 0]],
+            [[1, 1, 0], [1, 1, 0]],
+            [[0, 0, 0], [0, 0, 0]],
+            0,
+        ),
+        case(
+            "I_mixed_advantage_signs",
+            [[-0.2, -0.7, -1.4], [-0.5, -1.0, -1.8], [-0.1, -0.9, -2.0]],
+            [[-0.3, -0.6, -1.3], [-0.4, -1.1, -1.7], [-0.2, -0.8, -2.0]],
+            [[2.0, -1.0, 0.5], [-2.0, 1.5, -0.25], [0.75, -0.5, 0]],
+            [[1, 1, 1], [1, 1, 1], [1, 1, 0]],
+            [[0, 0, 0], [1, 1, 1], [0, 0, 0]],
+            1,
+        ),
+    ]
+
+
+def test_hpt_fixed_microbatch_objective_and_logprob_gradient_match_reference():
+    component_names = ("on_policy_loss", "sft_loss", "off_policy_loss", "pg_loss", "entropy_loss", "total_loss")
+    for case in _fixed_objective_cases():
+        reference_log_prob = case["log_prob"].clone().requires_grad_()
+        reference = _reference_hpt_fixed_microbatch(
+            old_log_prob=case["old_log_prob"],
+            log_prob=reference_log_prob,
+            advantages=case["advantages"],
+            response_mask=case["response_mask"],
+            prefix_mask=case["prefix_mask"],
+            offline_mode=case["offline_mode"],
+            entropy=case["entropy"],
+            entropy_coeff=case["entropy_coeff"],
+            sft_loss_coef=case["sft_loss_coef"],
+            off_policy_beta=case["off_policy_beta"],
+        )
+        reference["total_loss"].backward()
+
+        migrated_log_prob, migrated = _hpt_objective_case(case)
+        migrated["total_loss"].backward()
+
+        for component in component_names:
+            torch.testing.assert_close(migrated[component], reference[component], rtol=1e-7, atol=1e-9)
+        torch.testing.assert_close(migrated_log_prob.grad, reference_log_prob.grad, rtol=1e-7, atol=1e-9)
+        torch.testing.assert_close(migrated_log_prob.grad.norm(), reference_log_prob.grad.norm(), rtol=1e-7, atol=1e-9)
+        cosine = torch.nn.functional.cosine_similarity(
+            migrated_log_prob.grad.flatten(), reference_log_prob.grad.flatten(), dim=0
+        )
+        torch.testing.assert_close(cosine, cosine.new_tensor(1.0), rtol=1e-7, atol=1e-9)
 
 
 def _batch():
