@@ -144,6 +144,14 @@ def _attach_hpt_reward(batch: DataProto, reward_tensor: torch.Tensor) -> None:
     batch.batch["token_level_scores"] = reward_tensor
 
 
+def _global_ppo_mini_batch_size(configured_size: int, rollout_n: int) -> int:
+    """Match the legacy worker's prompt-to-sequence mini-batch conversion."""
+    global_size = configured_size * rollout_n
+    if global_size <= 0:
+        raise ValueError(f"global PPO mini-batch size must be positive, got {global_size}")
+    return global_size
+
+
 def compute_spec_decode_metrics(
     spec_drafts,
     spec_accepts,
@@ -1341,20 +1349,12 @@ class RayPPOTrainer:
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_mini_batch_size = _global_ppo_mini_batch_size(
+            self.config.actor_rollout_ref.actor.ppo_mini_batch_size,
+            self.config.actor_rollout_ref.rollout.n,
+        )
         hpt_config = self.config.get("hpt", None)
-        if hpt_config is not None and hpt_config.get("enabled", False):
-            # HPT routes every prompt independently, so the number of retained
-            # sequences is data-dependent.  Select the largest legal global
-            # mini-batch no larger than the configured PPO mini-batch.
-            dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-            upper_bound = min(ppo_mini_batch_size, len(batch))
-            ppo_mini_batch_size = next(
-                size
-                for size in range(upper_bound, dp_size - 1, -1)
-                if size % dp_size == 0 and len(batch) % size == 0
-            )
+        hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1369,6 +1369,8 @@ class RayPPOTrainer:
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
+            valid_mask_key="hpt_valid_mask" if hpt_enabled else None,
+            allow_partial_mini_batch=hpt_enabled,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")

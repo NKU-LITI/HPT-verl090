@@ -556,7 +556,14 @@ def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> Ten
     return tensor_dict1
 
 
-def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, dataloader_kwargs=None):
+def make_iterator(
+    tensordict: TensorDict,
+    mini_batch_size,
+    epochs,
+    seed=None,
+    dataloader_kwargs=None,
+    allow_partial=False,
+):
     """Create an iterator that yields mini-batches from a TensorDict.
 
     Wraps a TensorDict in a DataLoader-style iterator that yields mini-batches
@@ -565,17 +572,19 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
     Args:
         tensordict: The TensorDict to iterate over.
         mini_batch_size: Size of each mini-batch. Must evenly divide the
-            TensorDict's batch size.
+            TensorDict's batch size unless ``allow_partial`` is true.
         epochs: Number of times to iterate through the entire dataset.
         seed: Optional random seed for reproducible shuffling.
         dataloader_kwargs: Optional dict of additional kwargs to pass to
             the underlying DataLoader (e.g., shuffle=True, num_workers=4).
+        allow_partial: Allow a final mini-batch smaller than ``mini_batch_size``.
 
     Returns:
         An iterator that yields TensorDict mini-batches.
 
     Raises:
-        AssertionError: If batch size is not divisible by mini_batch_size.
+        AssertionError: If the batch size is not divisible by mini_batch_size
+            while ``allow_partial`` is false.
 
     Example:
         >>> td = TensorDict({"obs": torch.randn(100, 4)}, batch_size=[100])
@@ -585,7 +594,10 @@ def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, da
     """
     from torch.utils.data import DataLoader
 
-    assert tensordict.batch_size[0] % mini_batch_size == 0, f"{tensordict.batch_size[0]} % {mini_batch_size} != 0"
+    if not allow_partial:
+        assert tensordict.batch_size[0] % mini_batch_size == 0, (
+            f"{tensordict.batch_size[0]} % {mini_batch_size} != 0"
+        )
     # we can directly create a dataloader from TensorDict
     if dataloader_kwargs is None:
         dataloader_kwargs = {}

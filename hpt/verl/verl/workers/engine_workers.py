@@ -58,6 +58,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _select_valid_rows(data: TensorDict, valid_mask_key: str | None) -> TensorDict:
+    """Drop controller-side padding before sequence-level mini-batching."""
+    if valid_mask_key is None:
+        return data
+    valid_mask = tu.get(data, key=valid_mask_key)
+    if valid_mask is None:
+        raise KeyError(f"valid-row mask {valid_mask_key!r} is missing from the actor batch")
+    return data[valid_mask.bool()]
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -249,13 +259,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         """
         maybe_fix_3d_position_ids(data)
-        batch_size_per_dp = data.shape[0]
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
         epochs = tu.pop(data, key="epochs", default=1)
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        valid_mask_key = tu.pop(data, key="valid_mask_key", default=None)
+        allow_partial_mini_batch = tu.pop(data, key="allow_partial_mini_batch", default=False)
+
+        data = _select_valid_rows(data, valid_mask_key)
+
+        batch_size_per_dp = data.shape[0]
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
@@ -275,6 +290,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             epochs=epochs,
             seed=seed + self.engine.get_data_parallel_rank(),
             dataloader_kwargs=dataloader_kwargs,
+            allow_partial=allow_partial_mini_batch,
         )
 
         with (
@@ -283,7 +299,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
         ):
             # update
             output_lst = []
-            total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            if allow_partial_mini_batch:
+                iterations_per_epoch = (data.shape[0] + mini_batch_size_per_gpu - 1) // mini_batch_size_per_gpu
+            else:
+                iterations_per_epoch = data.shape[0] // mini_batch_size_per_gpu
+            total_num_iterations = iterations_per_epoch * epochs
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
                 maybe_fix_3d_position_ids(mini_batch_td)

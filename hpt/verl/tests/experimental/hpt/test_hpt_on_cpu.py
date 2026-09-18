@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl import DataProto
@@ -17,7 +18,9 @@ from verl.experimental.hpt.algorithm import apply_hpt
 from verl.experimental.hpt.dataset import _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.loss import compute_policy_loss_hpt
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward, _global_ppo_mini_batch_size
+from verl.utils import tensordict_utils as tu
+from verl.workers.engine_workers import _select_valid_rows
 
 
 class _Tokenizer:
@@ -119,6 +122,81 @@ def test_post_hpt_reward_stays_aligned_through_balance():
     row_ids = batch.batch["hpt_debug_sentinel"]
     assert row_ids.tolist() != list(range(len(batch)))
     torch.testing.assert_close(batch.batch["token_level_scores"].squeeze(-1), row_ids.float())
+
+
+def test_hpt_ppo_mini_batch_target_matches_reference():
+    # Reference worker normalization: configured 32 prompts * rollout.n 8,
+    # then DP dispatch turns the fixed global 256 into 128 rows per rank.
+    assert _global_ppo_mini_batch_size(configured_size=32, rollout_n=8) == 256
+
+
+def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"n": 8, "temperature": 1.0, "multi_turn": {"enable": False}},
+                "actor": {
+                    "ppo_mini_batch_size": 32,
+                    "ppo_epochs": 1,
+                    "data_loader_seed": 0,
+                    "shuffle": False,
+                    "calculate_entropy": False,
+                    "entropy_coeff": 0.0,
+                },
+            },
+            "hpt": {"enabled": True},
+        }
+    )
+    trainer.distillation_config = None
+    captured = []
+
+    class _ActorWorkerGroup:
+        def update_actor(self, data):
+            captured.append(
+                {
+                    "rows": len(data),
+                    "mini_batch_size": tu.get(data, "mini_batch_size"),
+                    "valid_mask_key": tu.get(data, "valid_mask_key"),
+                    "allow_partial": tu.get(data, "allow_partial_mini_batch"),
+                }
+            )
+            return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": {"mfu": 0.0}})
+
+    trainer.actor_rollout_wg = _ActorWorkerGroup()
+    for routed_rows in (2, 4):
+        batch = _batch().select_idxs(list(range(routed_rows)))
+        batch.batch["hpt_valid_mask"] = torch.ones(routed_rows, dtype=torch.bool)
+        trainer._update_actor(batch)
+
+    assert captured == [
+        {"rows": 2, "mini_batch_size": 256, "valid_mask_key": "hpt_valid_mask", "allow_partial": True},
+        {"rows": 4, "mini_batch_size": 256, "valid_mask_key": "hpt_valid_mask", "allow_partial": True},
+    ]
+
+
+def test_hpt_padding_is_removed_before_partial_mini_batch_split():
+    data = TensorDict(
+        {
+            "row_id": torch.arange(132),
+            "hpt_valid_mask": torch.tensor([True] * 130 + [False] * 2),
+        },
+        batch_size=[132],
+    )
+    real_data = _select_valid_rows(data, "hpt_valid_mask")
+    mini_batches = list(
+        tu.make_iterator(
+            real_data,
+            mini_batch_size=128,
+            epochs=1,
+            dataloader_kwargs={"shuffle": False},
+            allow_partial=True,
+        )
+    )
+
+    assert [len(mini_batch) for mini_batch in mini_batches] == [128, 2]
+    assert torch.equal(mini_batches[0]["row_id"], torch.arange(128))
+    assert torch.equal(mini_batches[1]["row_id"], torch.arange(128, 130))
 
 
 def test_switch_replaces_failed_group_and_masks_dp_padding():
