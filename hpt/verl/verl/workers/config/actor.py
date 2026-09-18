@@ -90,6 +90,9 @@ class PolicyLossConfig(BaseConfig):
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
+        loss_remove_clip (bool): Use the unclipped importance-ratio objective in the GRPO compatibility loss.
+        loss_remove_token_mean (bool): Normalize the token sum by the fixed response horizon instead of the
+            number of valid tokens in the GRPO compatibility loss.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -100,6 +103,8 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
+    loss_remove_clip: bool = False
+    loss_remove_token_mean: bool = False
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 

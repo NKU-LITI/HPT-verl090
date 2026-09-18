@@ -78,6 +78,14 @@ def get_policy_loss_fn(name):
         `(callable)`: The policy loss function.
     """
     loss_name = name
+    # Optional algorithms register themselves lazily so importing core PPO does
+    # not pull experimental dependencies into every worker process.
+    if loss_name in {"hpt", "grpo_compat"} and loss_name not in POLICY_LOSS_REGISTRY:
+        if loss_name == "hpt":
+            import verl.experimental.hpt.loss  # noqa: F401
+        else:
+            import verl.experimental.hpt.grpo  # noqa: F401
+
     if loss_name not in POLICY_LOSS_REGISTRY:
         raise ValueError(
             f"Unsupported loss mode: {loss_name}. Supported modes are: {list(POLICY_LOSS_REGISTRY.keys())}"

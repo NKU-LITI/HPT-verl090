@@ -79,6 +79,12 @@ policy_loss:
   # Must be set to a positive value when policy_loss.loss_mode is "dro".
   dro_beta: null
 
+  # Whether to remove PPO ratio clipping in the legacy GRPO compatibility loss
+  loss_remove_clip: false
+
+  # Whether to divide the token sum by response horizon instead of valid-token count
+  loss_remove_token_mean: false
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

@@ -88,9 +88,21 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    for hpt_key in (
+        "hpt_sft_mask",
+        "hpt_valid_mask",
+        "hpt_sft_weight",
+        "hpt_offline_mode",
+        "hpt_off_policy_beta",
+        "hpt_correct_mask",
+    ):
+        if hpt_key in data:
+            fields.append(hpt_key)
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    if "hpt_valid_mask" in data:
+        response_mask = response_mask & data["hpt_valid_mask"].bool().unsqueeze(-1)
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
@@ -101,6 +113,17 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    hpt_kwargs = {}
+    if loss_mode == "hpt":
+        hpt_kwargs = {
+            "hpt_sft_mask": data.get("hpt_sft_mask"),
+            "hpt_valid_mask": data.get("hpt_valid_mask"),
+            "hpt_sft_weight": data.get("hpt_sft_weight"),
+            "hpt_offline_mode": data.get("hpt_offline_mode"),
+            "hpt_off_policy_beta": data.get("hpt_off_policy_beta"),
+            "hpt_correct_mask": data.get("hpt_correct_mask"),
+            "entropy": entropy,
+        }
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
@@ -109,6 +132,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **hpt_kwargs,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
@@ -140,6 +164,20 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    from verl.utils.hpt_debug_dump import dump_boundary as _hpt_dump_boundary
+
+    _hpt_dump_boundary(
+        "verl090",
+        "actor_loss_complete",
+        batch=data,
+        extra={
+            "loss": policy_loss.detach(),
+            "pg_loss": pg_loss.detach(),
+            "entropy": entropy_loss.detach() if entropy is not None else None,
+            "loss_metrics": pg_metrics,
+        },
+    )
 
     return policy_loss, metrics
 

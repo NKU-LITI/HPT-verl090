@@ -1,0 +1,33 @@
+ File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/graph.py", line 2091, in _compile_to_module
+    self.codegen_with_cpp_wrapper() if self.cpp_wrapper else self.codegen()
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/graph.py", line 1998, in codegen
+    self._update_scheduler()
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/graph.py", line 1992, in _update_scheduler
+    self.scheduler = Scheduler(self.operations)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 1985, in __init__
+    self._init(nodes)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 2063, in _init
+    self.nodes = self.fuse_nodes(self.nodes)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 2567, in fuse_nodes
+    nodes = self.fuse_nodes_once(nodes)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 3048, in fuse_nodes_once
+    for node1, node2 in self.get_possible_fusions(nodes):
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 3174, in get_possible_fusions
+    check_all_pairs(node_grouping)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 3159, in check_all_pairs
+    if self.can_fuse(node1, node2):
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch/_inductor/scheduler.py", line 3673, in can_fuse
+    ) and self.get_backend(device).can_fuse_horizontal(node1, node2)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch_npu/_inductor/codegen/scheduling.py", line 391, in can_fuse
+    if not all(
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch_npu/_inductor/codegen/scheduling.py", line 392, in <genexpr>
+    SIMDKernel.is_compatible((numel2, rnumel2), n.get_ranges())
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch_npu/_inductor/codegen/triton.py", line 430, in is_compatible
+    NPUIndexTritonKernel._split_iteration_ranges(groups, lengths)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch_npu/_inductor/codegen/triton.py", line 1659, in _split_iteration_ranges
+    add_multiple_range(size_hint, return_getters)
+  File "/usr/local/python3.10/lib/python3.10/site-packages/torch_npu/_inductor/codegen/triton.py", line 1627, in add_multiple_range
+    while (group < len(remaining) and remaining[group] > 1) and (remained_size > 1):
+  File "/usr/local/python3.10/lib/python3.10/site-packages/sympy/core/relational.py", line 519, in __bool__
+    raise TypeError(
+torch._inductor.exc.InductorError: TypeError: cannot determine truth value of Relational: s0 > 1
