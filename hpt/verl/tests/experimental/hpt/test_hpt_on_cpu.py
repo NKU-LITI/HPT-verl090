@@ -6,6 +6,8 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+from types import SimpleNamespace
+
 import numpy as np
 import torch
 from tensordict import TensorDict
@@ -15,7 +17,7 @@ from verl.experimental.hpt.algorithm import apply_hpt
 from verl.experimental.hpt.dataset import _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.loss import compute_policy_loss_hpt
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward
 
 
 class _Tokenizer:
@@ -101,6 +103,22 @@ def test_gen_batch_keeps_target_on_driver_batch():
     gen_batch = trainer._get_gen_batch(data)
     assert data.non_tensor_batch["hpt_target"].tolist() == ["answer"]
     assert gen_batch.non_tensor_batch["hpt_target"].tolist() == ["answer"]
+
+
+def test_post_hpt_reward_stays_aligned_through_balance():
+    batch = _batch()
+    batch.batch["hpt_debug_sentinel"] = torch.arange(len(batch), dtype=torch.long)
+    reward = torch.arange(len(batch), dtype=torch.float32).unsqueeze(-1)
+    _attach_hpt_reward(batch, reward)
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.actor_rollout_wg = SimpleNamespace(_dispatch_info={"actor": [0, 1]})
+    trainer.use_prefix_grouper = False
+    trainer._balance_batch(batch, metrics={})
+
+    row_ids = batch.batch["hpt_debug_sentinel"]
+    assert row_ids.tolist() != list(range(len(batch)))
+    torch.testing.assert_close(batch.batch["token_level_scores"].squeeze(-1), row_ids.float())
 
 
 def test_switch_replaces_failed_group_and_masks_dp_padding():

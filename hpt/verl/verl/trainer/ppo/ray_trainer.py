@@ -135,6 +135,15 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _attach_hpt_reward(batch: DataProto, reward_tensor: torch.Tensor) -> None:
+    """Make the post-HPT reward a row-aligned DataProto field."""
+    if len(batch) != reward_tensor.shape[0]:
+        raise ValueError(
+            f"post-HPT reward rows must match the batch: {reward_tensor.shape[0]} != {len(batch)}"
+        )
+    batch.batch["token_level_scores"] = reward_tensor
+
+
 def compute_spec_decode_metrics(
     spec_drafts,
     spec_accepts,
@@ -1609,6 +1618,7 @@ class RayPPOTrainer:
                             config=hpt_config,
                             dp_size=actor_dp_size,
                         )
+                        _attach_hpt_reward(batch, reward_tensor)
                         _hpt_dump_boundary(
                             "verl090",
                             "hpt_switch_after",
@@ -1631,6 +1641,7 @@ class RayPPOTrainer:
                                 dp_size=actor_dp_size,
                             )
                             self._balance_batch(batch, metrics=metrics, logging_prefix="hpt_seqlen")
+                            reward_tensor = batch.batch["token_level_scores"]
                             _hpt_dump_boundary(
                                 "verl090",
                                 "balance_after",
