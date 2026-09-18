@@ -14,13 +14,25 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from verl import DataProto
+from verl.experimental.hpt.actor_update import (
+    legacy_grad_norm_skip,
+    legacy_gradient_accumulation,
+    scale_legacy_backward_loss,
+)
 from verl.experimental.hpt.algorithm import apply_hpt
 from verl.experimental.hpt.dataset import _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
+from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_hpt_batch_like_reference
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, _attach_hpt_reward, _global_ppo_mini_batch_size
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
+    _attach_hpt_reward,
+    _global_ppo_mini_batch_size,
+    _hpt_legacy_gradient_accumulation,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.seqlen_balancing import rearrange_micro_batches_hpt_legacy
+from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 from verl.workers.engine.utils import prepare_micro_batches
 from verl.workers.engine_workers import _select_valid_rows
 
@@ -369,6 +381,7 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
                 "rollout": {"n": 8, "temperature": 1.0, "multi_turn": {"enable": False}},
                 "actor": {
                     "ppo_mini_batch_size": 32,
+                    "ppo_micro_batch_size": 1,
                     "ppo_epochs": 1,
                     "data_loader_seed": 0,
                     "shuffle": False,
@@ -391,6 +404,8 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
                     "valid_mask_key": tu.get(data, "valid_mask_key"),
                     "allow_partial": tu.get(data, "allow_partial_mini_batch"),
                     "legacy_packing": tu.get(data, "hpt_legacy_dynamic_batching"),
+                    "gradient_accumulation": tu.get(data, "hpt_legacy_gradient_accumulation"),
+                    "max_grad_norm": tu.get(data, "hpt_legacy_max_grad_norm"),
                 }
             )
             return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": {"mfu": 0.0}})
@@ -408,6 +423,8 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
             "valid_mask_key": "hpt_valid_mask",
             "allow_partial": True,
             "legacy_packing": True,
+            "gradient_accumulation": 32,
+            "max_grad_norm": 80.0,
         },
         {
             "rows": 4,
@@ -415,8 +432,65 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
             "valid_mask_key": "hpt_valid_mask",
             "allow_partial": True,
             "legacy_packing": True,
+            "gradient_accumulation": 32,
+            "max_grad_norm": 80.0,
         },
     ]
+
+
+def test_hpt_actor_update_legacy_scale_and_skip_boundaries():
+    actor_config = OmegaConf.create({"ppo_mini_batch_size": 32, "ppo_micro_batch_size": 1})
+    assert _hpt_legacy_gradient_accumulation(actor_config) == 32
+    assert legacy_gradient_accumulation(32, 1) == 32
+
+    parameter = torch.tensor([1.0, -2.0], requires_grad=True)
+    raw_losses = [parameter @ torch.tensor([16.0, 0.0]), parameter @ torch.tensor([0.0, 8.0])]
+    for raw_loss in raw_losses:
+        scale_legacy_backward_loss(raw_loss, 32).backward()
+    torch.testing.assert_close(parameter.grad, torch.tensor([0.5, 0.25]))
+
+    assert legacy_grad_norm_skip(torch.tensor(79.999), 80.0) == (False, False)
+    assert legacy_grad_norm_skip(torch.tensor(80.0), 80.0) == (False, False)
+    assert legacy_grad_norm_skip(torch.tensor(80.001), 80.0) == (True, False)
+    assert legacy_grad_norm_skip(torch.tensor(float("inf")), 80.0) == (True, True)
+
+
+def test_hpt_fsdp_optimizer_uses_pre_clip_norm_for_whole_step_skip():
+    class _CountingSGD(torch.optim.SGD):
+        def __init__(self, params):
+            super().__init__(params, lr=0.1)
+            self.step_count = 0
+
+        def step(self, closure=None):
+            self.step_count += 1
+            return super().step(closure)
+
+    def run(pre_clip_gradient):
+        parameter = torch.nn.Parameter(torch.tensor([0.0]))
+        optimizer = _CountingSGD([parameter])
+        parameter.grad = torch.tensor([pre_clip_gradient])
+        engine = SimpleNamespace(
+            optimizer_config=SimpleNamespace(clip_grad=1.0),
+            module=torch.nn.ParameterList([parameter]),
+            optimizer=optimizer,
+            scaler=None,
+            _hpt_legacy_max_grad_norm=80.0,
+            _qat_enabled=False,
+        )
+        grad_norm = FSDPEngine.optimizer_step(engine)
+        return grad_norm, optimizer.step_count, parameter.detach().item(), parameter.grad
+
+    grad_norm, step_count, parameter, gradient = run(79.999)
+    assert grad_norm == torch.tensor(79.999).item()
+    assert step_count == 1
+    assert parameter < 0
+    assert gradient is not None
+
+    grad_norm, step_count, parameter, gradient = run(80.001)
+    assert grad_norm == torch.tensor(80.001).item()
+    assert step_count == 0
+    assert parameter == 0.0
+    assert gradient is None
 
 
 def test_hpt_padding_is_removed_before_partial_mini_batch_split():
@@ -506,7 +580,7 @@ def test_prepare_micro_batches_selects_legacy_partition_only_when_flagged():
     assert stock_partitions != hpt_partitions
 
 
-def test_switch_replaces_failed_group_and_masks_dp_padding():
+def test_switch_matches_legacy_post_selector_order_before_padding():
     reward = torch.zeros(4, 3)
     reward[2, 1] = 1
     output, output_reward, metrics = apply_hpt(
@@ -517,14 +591,48 @@ def test_switch_replaces_failed_group_and_masks_dp_padding():
         dp_size=2,
     )
 
-    # Failed group a -> one SFT row. Solved group b -> two RL rows. One
-    # additional row is padding so the actor DP size remains valid.
-    assert len(output) == 4
-    assert output.batch["hpt_sft_mask"].tolist() == [True, False, False, True]
-    assert output.batch["hpt_valid_mask"].tolist() == [True, True, True, False]
-    assert output_reward.shape == (4, 3)
+    # Reference retains solved rows in original order, then appends failed
+    # targets in sorted-UID order. Padding occurs later in the trainer.
+    assert len(output) == 3
+    assert output.non_tensor_batch["uid"].tolist() == ["b", "b", "a"]
+    assert output.batch["hpt_sft_mask"].tolist() == [False, False, True]
+    assert output.batch["hpt_valid_mask"].tolist() == [True, True, True]
+    assert output_reward.shape == (3, 3)
     assert metrics["hpt/sft_groups"] == 1
     assert metrics["hpt/rl_groups"] == 1
+
+
+def test_hpt_final_padding_and_balance_match_legacy_layout():
+    costs = [2, 9, 3, 8, 4]
+    attention_mask = torch.zeros(5, 9, dtype=torch.long)
+    for row, cost in enumerate(costs):
+        attention_mask[row, :cost] = 1
+    batch = DataProto(
+        batch=TensorDict(
+            {
+                "attention_mask": attention_mask,
+                "row_id": torch.arange(5),
+                "hpt_valid_mask": torch.ones(5, dtype=torch.bool),
+            },
+            batch_size=[5],
+        ),
+        non_tensor_batch={"uid": np.array(["u0", "u1", "u2", "u3", "u4"], dtype=object)},
+    )
+
+    batch, pad_size = pad_hpt_batch_like_reference(batch, 8, mark_actor_padding=True)
+    assert pad_size == 3
+    assert batch.batch["row_id"].tolist() == [0, 1, 2, 3, 4, 4, 4, 4]
+    assert batch.non_tensor_batch["uid"].tolist() == ["u0", "u1", "u2", "u3", "u4", "u4", "u4", "u4"]
+    assert batch.batch["whether_pad"].tolist() == [False] * 5 + [True] * 3
+    assert batch.batch["hpt_valid_mask"].tolist() == [True] * 5 + [False] * 3
+
+    partitions, sequence_costs = balance_hpt_batch_like_reference(batch, dp_size=2)
+    assert sequence_costs == [2, 9, 3, 8, 4, 4, 4, 4]
+    assert partitions == [[2, 3, 4, 6], [0, 1, 5, 7]]
+    assert batch.batch["row_id"].tolist() == [2, 3, 4, 4, 0, 1, 4, 4]
+    # Padding participates in balance/rank assignment, then exits before actor mini-batching.
+    real_batch = _select_valid_rows(batch.to_tensordict(), "hpt_valid_mask")
+    assert real_batch["row_id"].tolist() == [2, 3, 4, 0, 1]
 
 
 def test_hpt_loss_combines_sft_and_ppo_and_ignores_padding():

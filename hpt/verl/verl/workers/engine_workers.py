@@ -293,8 +293,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
             allow_partial=allow_partial_mini_batch,
         )
 
+        hpt_legacy_control = tu.get(
+            data, key="hpt_legacy_gradient_accumulation", default=None
+        ) is not None
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            self.engine.train_mode(
+                disable_auto_offload=disable_auto_offload,
+                zero_grad_on_exit=not hpt_legacy_control,
+            ),
             Timer(name="train_batch", logger=None),
         ):
             # update
@@ -361,6 +367,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
         images_seqlens = tu.get(data, key="images_seqlens", default=None)
+        hpt_legacy_control = tu.get(
+            data, key="hpt_legacy_gradient_accumulation", default=None
+        ) is not None
+        update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
 
         # inject engineering parameters if not specified
         default_keys = dict(
@@ -376,15 +386,22 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 tu.assign_non_tensor(data, **{key: val})
 
         with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            self.engine.train_mode(
+                disable_auto_offload=disable_auto_offload,
+                zero_grad_on_exit=not hpt_legacy_control,
+            ),
             Timer(name="train_batch", logger=None) as timer,
         ):
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            # The 0.1 actor clears once after the final PPO mini-batch and
+            # before its one scheduler step. Intermediate successful steps
+            # retain their clipped gradient until the next mini-batch starts.
+            if hpt_legacy_control and update_lr_scheduler:
+                self.engine.optimizer_zero_grad()
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
 
-        update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
         if update_lr_scheduler:
             lr = self.engine.lr_scheduler_step()

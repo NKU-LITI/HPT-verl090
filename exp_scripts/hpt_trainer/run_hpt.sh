@@ -43,8 +43,10 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.actor.optim.lr="${LR}" \
+  actor_rollout_ref.actor.optim.clip_grad=1.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
-  actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+  actor_rollout_ref.actor.ppo_micro_batch_size=1 \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
   actor_rollout_ref.actor.policy_loss.loss_mode=hpt \
   actor_rollout_ref.actor.policy_loss.loss_remove_clip=true \
@@ -74,6 +76,7 @@ python3 -m verl.trainer.main_ppo \
   +hpt.offline_loss_type="${OFFLINE_LOSS_TYPE}" \
   +hpt.sft_loss_coef="${SFT_LOSS_COEF}" \
   +hpt.off_policy_beta="${OFF_POLICY_BETA}" \
+  +hpt.max_grad_norm=80.0 \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.use_v1=False \

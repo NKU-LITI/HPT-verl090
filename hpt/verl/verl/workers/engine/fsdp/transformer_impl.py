@@ -32,6 +32,7 @@ from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConf
 from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
+from verl.experimental.hpt.actor_update import legacy_grad_norm_skip, scale_legacy_backward_loss
 from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
@@ -709,6 +710,14 @@ class FSDPEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+        hpt_gradient_accumulation = tu.get_non_tensor_data(
+            data=data, key="hpt_legacy_gradient_accumulation", default=None
+        )
+        # optimizer_step follows this forward/backward call synchronously. Resetting
+        # this for every batch prevents the HPT-only threshold leaking to stock verl.
+        self._hpt_legacy_max_grad_norm = tu.get_non_tensor_data(
+            data=data, key="hpt_legacy_max_grad_norm", default=None
+        )
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
@@ -732,10 +741,11 @@ class FSDPEngine(BaseEngine):
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
 
                 if not forward_only:
+                    backward_loss = scale_legacy_backward_loss(loss, hpt_gradient_accumulation)
                     if scaler is not None:
-                        scaler.scale(loss).backward()
+                        scaler.scale(backward_loss).backward()
                     else:
-                        loss.backward()
+                        backward_loss.backward()
                     if not return_model_output:
                         # Standard training discards model_output (train_batch pops it); keeping it accumulates
                         # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
@@ -785,17 +795,35 @@ class FSDPEngine(BaseEngine):
         if isinstance(grad_norm, DTensor):
             grad_norm = grad_norm.full_tensor()
 
-        if scaler is not None:
-            # scaler handles inf/nan skipping internally via _check_inf_per_device.
-            scaler.step(self.optimizer)
-            scaler.update()
-        else:
-            # if grad_norm is not finite, skip the update
-            if not torch.isfinite(grad_norm):
-                print(f"WARN: grad_norm is not finite: {grad_norm}")
-                self.optimizer.zero_grad()
+        max_grad_norm = getattr(self, "_hpt_legacy_max_grad_norm", None)
+        if max_grad_norm is None:
+            # Preserve stock verl behavior byte-for-byte at the control-flow level.
+            if scaler is not None:
+                scaler.step(self.optimizer)
+                scaler.update()
             else:
-                self.optimizer.step()
+                if not torch.isfinite(grad_norm):
+                    print(f"WARN: grad_norm is not finite: {grad_norm}")
+                    self.optimizer.zero_grad()
+                else:
+                    self.optimizer.step()
+        else:
+            skip_step, nonfinite = legacy_grad_norm_skip(grad_norm, max_grad_norm)
+            if scaler is not None:
+                if skip_step:
+                    self.optimizer.zero_grad()
+                else:
+                    scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                if skip_step:
+                    if nonfinite:
+                        print(f"WARN: grad_norm is not finite: {grad_norm}")
+                    else:
+                        print(f"WARN: grad_norm is too large: {grad_norm}")
+                    self.optimizer.zero_grad()
+                else:
+                    self.optimizer.step()
 
         if self._qat_enabled:
             from verl.utils.qat.core import invalidate_all_scales

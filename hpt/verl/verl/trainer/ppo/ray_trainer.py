@@ -152,6 +152,16 @@ def _global_ppo_mini_batch_size(configured_size: int, rollout_n: int) -> int:
     return global_size
 
 
+def _hpt_legacy_gradient_accumulation(actor_config) -> int:
+    """Recover the fixed loss denominator used by the verl 0.1 HPT actor."""
+    from verl.experimental.hpt.actor_update import legacy_gradient_accumulation
+
+    micro_batch_size = actor_config.get("ppo_micro_batch_size", None)
+    if micro_batch_size is None:
+        raise ValueError("HPT compatibility requires actor.ppo_micro_batch_size")
+    return legacy_gradient_accumulation(actor_config.ppo_mini_batch_size, micro_batch_size)
+
+
 def compute_spec_decode_metrics(
     spec_drafts,
     spec_accepts,
@@ -1173,7 +1183,14 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(
+        self,
+        batch: DataProto,
+        metrics,
+        logging_prefix="global_seqlen",
+        keep_minibatch=False,
+        hpt_legacy=False,
+    ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
@@ -1186,6 +1203,19 @@ class RayPPOTrainer:
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+
+        if hpt_legacy:
+            from verl.experimental.hpt.layout import balance_hpt_batch_like_reference
+
+            global_partition_lst, legacy_seqlen_lst = balance_hpt_batch_like_reference(batch, dp_size)
+            metrics.update(
+                log_seqlen_unbalance(
+                    seqlen_list=legacy_seqlen_lst,
+                    partitions=global_partition_lst,
+                    prefix=logging_prefix,
+                )
+            )
+            return
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
@@ -1323,12 +1353,6 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
-        if "hpt_valid_mask" in batch.batch:
-            # The engine derives its global token denominator from
-            # response_mask before ppo_loss runs.  Mask HPT's DP-only padding
-            # here so it contributes neither gradients nor normalization.
-            invalid_rows = ~batch.batch["hpt_valid_mask"].bool()
-            batch.batch["response_mask"][invalid_rows] = 0
         # update actor
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
@@ -1355,6 +1379,10 @@ class RayPPOTrainer:
         )
         hpt_config = self.config.get("hpt", None)
         hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
+        hpt_gradient_accumulation = (
+            _hpt_legacy_gradient_accumulation(self.config.actor_rollout_ref.actor) if hpt_enabled else None
+        )
+        hpt_max_grad_norm = hpt_config.get("max_grad_norm", 80.0) if hpt_enabled else None
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1372,6 +1400,8 @@ class RayPPOTrainer:
             valid_mask_key="hpt_valid_mask" if hpt_enabled else None,
             allow_partial_mini_batch=hpt_enabled,
             hpt_legacy_dynamic_batching=hpt_enabled,
+            hpt_legacy_gradient_accumulation=hpt_gradient_accumulation,
+            hpt_legacy_max_grad_norm=hpt_max_grad_norm,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
@@ -1558,11 +1588,14 @@ class RayPPOTrainer:
                         step=self.global_steps,
                         dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
                     )
+                    hpt_config = self.config.get("hpt", None)
+                    hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
+                    hpt_inference_pad_size = 0
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
-                    if self.config.trainer.balance_batch:
+                    if self.config.trainer.balance_batch and not hpt_enabled:
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
@@ -1591,8 +1624,7 @@ class RayPPOTrainer:
                             dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
                         )
 
-                    hpt_config = self.config.get("hpt", None)
-                    if hpt_config is not None and hpt_config.get("enabled", False):
+                    if hpt_enabled:
                         if self.use_critic:
                             raise ValueError("HPT migration currently supports critic-free estimators such as GRPO")
                         if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "hpt":
@@ -1634,25 +1666,17 @@ class RayPPOTrainer:
                         # Reward-side auxiliary values describe the discarded
                         # rollout batch and cannot be aligned after HPT routing.
                         reward_extra_infos_dict = {}
-                        if self.config.trainer.balance_batch:
-                            _hpt_dump_boundary(
-                                "verl090",
-                                "balance_before",
-                                batch=batch,
-                                reward=reward_tensor,
-                                step=self.global_steps,
-                                dp_size=actor_dp_size,
-                            )
-                            self._balance_batch(batch, metrics=metrics, logging_prefix="hpt_seqlen")
-                            reward_tensor = batch.batch["token_level_scores"]
-                            _hpt_dump_boundary(
-                                "verl090",
-                                "balance_after",
-                                batch=batch,
-                                reward=reward_tensor,
-                                step=self.global_steps,
-                                dp_size=actor_dp_size,
-                            )
+                        from verl.experimental.hpt.layout import (
+                            HPT_LEGACY_PADDING_DIVISOR,
+                            pad_hpt_batch_like_reference,
+                        )
+
+                        batch, hpt_inference_pad_size = pad_hpt_batch_like_reference(
+                            batch,
+                            HPT_LEGACY_PADDING_DIVISOR,
+                            mark_actor_padding=False,
+                        )
+                        reward_tensor = batch.batch["token_level_scores"]
                         batch.meta_info["global_token_num"] = torch.sum(
                             batch.batch["attention_mask"], dim=-1
                         ).tolist()
@@ -1719,6 +1743,10 @@ class RayPPOTrainer:
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
+                    if hpt_enabled and hpt_inference_pad_size:
+                        batch = unpad_dataproto(batch, hpt_inference_pad_size)
+                        reward_tensor = batch.batch["token_level_scores"]
+
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
@@ -1779,6 +1807,46 @@ class RayPPOTrainer:
                             step=self.global_steps,
                             dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
                         )
+
+                    if hpt_enabled:
+                        from verl.experimental.hpt.layout import (
+                            HPT_LEGACY_PADDING_DIVISOR,
+                            pad_hpt_batch_like_reference,
+                        )
+
+                        batch, final_hpt_pad_size = pad_hpt_batch_like_reference(
+                            batch,
+                            HPT_LEGACY_PADDING_DIVISOR,
+                            mark_actor_padding=True,
+                        )
+                        metrics["hpt/padded_sequences"] = float(final_hpt_pad_size)
+                        reward_tensor = batch.batch["token_level_scores"]
+                        _hpt_dump_boundary(
+                            "verl090",
+                            "balance_before",
+                            batch=batch,
+                            reward=reward_tensor,
+                            step=self.global_steps,
+                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
+                        )
+                        self._balance_batch(
+                            batch,
+                            metrics=metrics,
+                            logging_prefix="hpt_seqlen",
+                            hpt_legacy=True,
+                        )
+                        reward_tensor = batch.batch["token_level_scores"]
+                        _hpt_dump_boundary(
+                            "verl090",
+                            "balance_after",
+                            batch=batch,
+                            reward=reward_tensor,
+                            step=self.global_steps,
+                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
+                        )
+                        batch.meta_info["global_token_num"] = torch.sum(
+                            batch.batch["attention_mask"], dim=-1
+                        ).tolist()
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):

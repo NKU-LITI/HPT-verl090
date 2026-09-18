@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
 import numpy as np
@@ -18,7 +17,6 @@ import torch
 from omegaconf import DictConfig
 
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor
 from verl.utils.model import compute_position_id_with_mask
 
 
@@ -111,24 +109,36 @@ def apply_hpt(
     scores = reward_tensor.sum(dim=-1)
     uids = batch.non_tensor_batch["uid"]
 
-    keep: list[int] = []
-    sft_source_rows: set[int] = set()
     solved_groups = 0
     sft_groups = 0
-    for uid in dict.fromkeys(uids.tolist()):
+    sorted_uids = np.unique(uids)
+    uid_indices: dict[Any, list[int]] = {}
+    use_sft_by_uid: dict[Any, bool] = {}
+    for uid in sorted_uids:
         indices = np.flatnonzero(uids == uid).tolist()
+        uid_indices[uid] = indices
         successes = int(torch.isclose(scores[indices], scores.new_tensor(success_reward)).sum())
         solved_groups += int(successes > 0)
         use_sft = strategy == "mix" or successes <= switch_gate
-        if strategy == "switch" and use_sft:
-            keep.append(indices[0])
-            sft_source_rows.add(indices[0])
-            sft_groups += 1
-        else:
+        use_sft_by_uid[uid] = use_sft
+        sft_groups += int(use_sft)
+
+    if strategy == "switch":
+        # Reference keeps solved rollout rows in their original global order,
+        # then appends one target row for each failed UID in np.unique order.
+        solved_rows = [row for row, uid in enumerate(uids) if not use_sft_by_uid[uid]]
+        target_rows = [uid_indices[uid][0] for uid in sorted_uids if use_sft_by_uid[uid]]
+        keep = solved_rows + target_rows
+        sft_source_rows = set(target_rows)
+    else:
+        # Preserve the existing noncanonical mix path; Phase 4 only changes switch.
+        keep = []
+        sft_source_rows = set()
+        for uid in dict.fromkeys(uids.tolist()):
+            indices = uid_indices[uid]
             keep.extend(indices)
-            if use_sft:
+            if use_sft_by_uid[uid]:
                 sft_source_rows.add(indices[0])
-                sft_groups += 1
 
     selected = batch.select_idxs(keep)
     selected_rewards = reward_tensor[torch.tensor(keep, device=reward_tensor.device)]
@@ -162,17 +172,10 @@ def apply_hpt(
         selected_rewards.sum(dim=-1), selected_rewards.new_tensor(success_reward)
     ).to(selected.batch.device)
 
-    selected, pad_size = pad_dataproto_to_divisor(selected, dp_size)
-    if pad_size:
-        padding_indices = torch.arange(pad_size, device=selected_rewards.device) % len(selected_rewards)
-        selected_rewards = torch.cat([selected_rewards, selected_rewards[padding_indices]], dim=0)
-        selected.batch["hpt_valid_mask"][-pad_size:] = False
-        # Isolate padding copies from GRPO groups so they cannot change the
-        # mean/std of the real prompt group.
-        selected.non_tensor_batch["uid"][-pad_size:] = np.array(
-            [f"hpt-padding-{uuid.uuid4()}" for _ in range(pad_size)], dtype=object
-        )
-        selected_rewards[-pad_size:] = 0
+    # Padding belongs to two later trainer boundaries in the 0.1 dataflow:
+    # temporary old-log-prob padding and final post-advantage actor padding.
+    del dp_size
+    pad_size = 0
 
     metrics = {
         "hpt/sft_groups": float(sft_groups),
