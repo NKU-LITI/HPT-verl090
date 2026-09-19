@@ -33,22 +33,18 @@ export DEVICE_TYPE=npu
 export VLLM_ASCEND_ENABLE_NZ=0
 export TORCHINDUCTOR_DYNAMIC_SHAPES=0
 
-ROOT=${WORK_DIR:-/workplace/nankai/liting_space/SFT-RL/HPT-verl090}
+ROOT=$WORK_DIR/verl
 OUTPUT_PATH=${OUTPUT_PATH:-$ROOT/outputs}
 export WANDB_PROJECT=${WANDB_PROJECT:-"luffy-srft-dft"}
 export PYTHONPATH=$ROOT/hpt:$ROOT/hpt/verl:${PYTHONPATH:-}
 
-UNIFY_STRATEGY="switch"
-SWITCH_GATE=${SWITCH_GATE:-0}
-OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-dft}
-SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
-OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
-MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
+UNIFY_STRATEGY="no"
+OFFLINE_LOSS_TYPE="grpo"
 
 LR=${LR:-5e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B-16k}
 MODEL_PATH=${MODEL_PATH:-"/home/ma-user/work/Scaf-GRPO/${MODEL}"}
-EXP_BASENAME=${EXP_BASENAME:-"VERL090_NPU_${DATE}_${UNIFY_STRATEGY}-${OFFLINE_LOSS_TYPE}-${SFT_LOSS_COEF}_gate@${SWITCH_GATE}_${MODEL}_lr@${LR}_${TIME_TAG}"}
+EXP_BASENAME=${EXP_BASENAME:-"VERL090_NPU_${DATE}_GRPO_${MODEL}_lr@${LR}_${TIME_TAG}"}
 EXP_NAME="${OUTPUT_PATH}/${EXP_BASENAME}"
 
 export TENSORBOARD_DIR="${EXP_NAME}/tensorboard"
@@ -67,7 +63,7 @@ TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/tes
 
 cd $ROOT/hpt/verl/
 
-python3 -m verl.trainer.main_ppo \
+python3.10 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.use_kl_in_reward=False \
@@ -80,20 +76,15 @@ python3 -m verl.trainer.main_ppo \
     data.train_batch_size=64 \
     data.max_prompt_length=1024 \
     data.max_response_length=4096 \
-    data.custom_cls.path="$ROOT/hpt/verl/verl/experimental/hpt/dataset.py" \
-    data.custom_cls.name=HPTDataset \
-    +data.target_key=target \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=$LR \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=1 \
-    actor_rollout_ref.actor.optim.clip_grad=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
-    actor_rollout_ref.actor.policy_loss.loss_mode=hpt \
+    actor_rollout_ref.actor.policy_loss.loss_mode=grpo_compat \
     actor_rollout_ref.actor.policy_loss.loss_remove_token_mean=true \
     actor_rollout_ref.actor.policy_loss.loss_remove_clip=true \
     actor_rollout_ref.actor.use_kl_loss=False \
@@ -122,17 +113,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward.custom_reward_function.path="$ROOT/hpt/verl/verl/experimental/hpt/reward.py" \
     reward.custom_reward_function.name=compute_score \
-    reward.reward_manager.source=importlib \
-    reward.reward_manager.name=LegacyHPTRewardManager \
-    reward.reward_manager.module.path="$ROOT/hpt/verl/verl/experimental/hpt/reward_manager.py" \
-    +hpt.enabled=True \
-    +hpt.strategy="$UNIFY_STRATEGY" \
-    +hpt.switch_gate=$SWITCH_GATE \
-    +hpt.success_reward=1.0 \
-    +hpt.offline_loss_type="$OFFLINE_LOSS_TYPE" \
-    +hpt.sft_loss_coef=$SFT_LOSS_COEF \
-    +hpt.off_policy_beta=$OFF_POLICY_BETA \
-    +hpt.max_grad_norm=$MAX_GRAD_NORM \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="$WANDB_PROJECT" \
     trainer.experiment_name="$EXP_BASENAME" \

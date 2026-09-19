@@ -33,7 +33,7 @@ export DEVICE_TYPE=npu
 export VLLM_ASCEND_ENABLE_NZ=0
 export TORCHINDUCTOR_DYNAMIC_SHAPES=0
 
-ROOT=${WORK_DIR:-/workplace/nankai/liting_space/SFT-RL/HPT-verl090}
+ROOT=$WORK_DIR/verl
 OUTPUT_PATH=${OUTPUT_PATH:-$ROOT/outputs}
 export WANDB_PROJECT=${WANDB_PROJECT:-"luffy-srft-dft"}
 export PYTHONPATH=$ROOT/hpt:$ROOT/hpt/verl:${PYTHONPATH:-}
@@ -67,7 +67,7 @@ TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/tes
 
 cd $ROOT/hpt/verl/
 
-python3 -m verl.trainer.main_ppo \
+python3.10 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.use_kl_in_reward=False \

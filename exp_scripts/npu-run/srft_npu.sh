@@ -33,14 +33,14 @@ export DEVICE_TYPE=npu
 export VLLM_ASCEND_ENABLE_NZ=0
 export TORCHINDUCTOR_DYNAMIC_SHAPES=0
 
-ROOT=${WORK_DIR:-/workplace/nankai/liting_space/SFT-RL/HPT-verl090}
+ROOT=$WORK_DIR/verl
 OUTPUT_PATH=${OUTPUT_PATH:-$ROOT/outputs}
 export WANDB_PROJECT=${WANDB_PROJECT:-"luffy-srft-dft"}
 export PYTHONPATH=$ROOT/hpt:$ROOT/hpt/verl:${PYTHONPATH:-}
 
 UNIFY_STRATEGY="mix"
 SWITCH_GATE=${SWITCH_GATE:-0}
-OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-off_policy}
+OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-srft}
 SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
 OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
@@ -48,7 +48,7 @@ MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
 LR=${LR:-1e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B-16k}
 MODEL_PATH=${MODEL_PATH:-"/home/ma-user/work/Scaf-GRPO/${MODEL}"}
-EXP_BASENAME=${EXP_BASENAME:-"VERL090_NPU_${DATE}_LUFFY_${MODEL}_lr@${LR}_${TIME_TAG}"}
+EXP_BASENAME=${EXP_BASENAME:-"VERL090_NPU_${DATE}_SRFT_${MODEL}_lr@${LR}_${TIME_TAG}"}
 EXP_NAME="${OUTPUT_PATH}/${EXP_BASENAME}"
 
 export TENSORBOARD_DIR="${EXP_NAME}/tensorboard"
@@ -67,7 +67,7 @@ TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/tes
 
 cd $ROOT/hpt/verl/
 
-python3 -m verl.trainer.main_ppo \
+python3.10 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=False \
     algorithm.use_kl_in_reward=False \
@@ -96,6 +96,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.loss_mode=hpt \
     actor_rollout_ref.actor.policy_loss.loss_remove_token_mean=true \
     actor_rollout_ref.actor.policy_loss.loss_remove_clip=true \
+    actor_rollout_ref.actor.calculate_entropy=True \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.use_torch_compile=False \
