@@ -1405,6 +1405,11 @@ class RayPPOTrainer:
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
+        if hpt_enabled and "hpt/legacy_actor_loss" in actor_output:
+            # The generic engine reports the sum of raw micro-batch losses.
+            # Canonical HPT instead logs the mean of the legacy
+            # gradient-accumulation-scaled losses, matching verl 0.1.
+            actor_output["loss"] = actor_output.pop("hpt/legacy_actor_loss")
         actor_output = rename_dict(actor_output, "actor/")
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")

@@ -26,6 +26,69 @@ def _get(config: DictConfig | dict, key: str, default: Any) -> Any:
     return config.get(key, default)
 
 
+def _reward_matches(scores: torch.Tensor, value: float) -> torch.Tensor:
+    """Match sequence rewards using the same tolerance as HPT routing."""
+    return torch.isclose(scores, scores.new_tensor(value))
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+    """Return a row-wise mean while preserving the legacy NaN for an empty side."""
+    selected = values[mask.to(device=values.device)]
+    if selected.numel() == 0:
+        return float("nan")
+    return selected.float().mean().detach().item()
+
+
+def _compute_batch_metrics(
+    scores: torch.Tensor,
+    uids: np.ndarray,
+    *,
+    success_reward: float,
+    failure_reward: float,
+    format_reward: float,
+) -> dict[str, float]:
+    """Compute the rollout-batch metrics emitted by the 0.1 HPT trainer."""
+    solve_none = 0
+    solve_none_format = 0
+    solve_all = 0
+    for uid in np.unique(uids):
+        group_scores = scores[np.flatnonzero(uids == uid).tolist()]
+        if _reward_matches(group_scores, failure_reward).all():
+            solve_none += 1
+        elif _reward_matches(group_scores, success_reward).all():
+            solve_all += 1
+        elif _reward_matches(group_scores, format_reward).all():
+            solve_none_format += 1
+
+    return {
+        "batch/solve_none": float(solve_none),
+        "batch/solve_none_format": float(solve_none_format),
+        "batch/solve_all": float(solve_all),
+        "batch/solved": _reward_matches(scores, success_reward).float().mean().item(),
+        "batch/failed": _reward_matches(scores, failure_reward).float().mean().item(),
+    }
+
+
+def _compute_on_off_metrics(
+    batch: DataProto,
+    reward_tensor: torch.Tensor,
+    prefix_mask: torch.Tensor,
+) -> dict[str, float]:
+    """Compute post-routing on/off-policy statistics before HPT padding."""
+    off_policy_mask = prefix_mask.any(dim=-1)
+    on_policy_mask = ~off_policy_mask
+    response_length = batch.batch["response_mask"].sum(dim=-1)
+    sequence_score = reward_tensor.sum(dim=-1)
+
+    return {
+        "on_off_metrics/on_response_length_mean": _masked_mean(response_length, on_policy_mask),
+        "on_off_metrics/off_response_length_mean": _masked_mean(response_length, off_policy_mask),
+        "on_off_metrics/on_score": _masked_mean(sequence_score, on_policy_mask),
+        "on_off_metrics/off_score": _masked_mean(sequence_score, off_policy_mask),
+        "on_off_metrics/off_example_ratio": off_policy_mask.float().mean().item(),
+    }
+
+
 def _tokenize_target(tokenizer, target: str, response_width: int) -> tuple[torch.Tensor, torch.Tensor]:
     token_ids = tokenizer(target, add_special_tokens=False, return_attention_mask=False)["input_ids"]
     if token_ids and isinstance(token_ids[0], list):
@@ -98,6 +161,8 @@ def apply_hpt(
         raise KeyError("HPT requires the PPO trainer's per-prompt 'uid' field")
 
     success_reward = float(_get(config, "success_reward", 1.0))
+    failure_reward = float(_get(config, "failure_reward", 0.0))
+    format_reward = float(_get(config, "format_reward", -1.0))
     switch_gate = int(_get(config, "switch_gate", 0))
     sft_loss_coef = float(_get(config, "sft_loss_coef", 1.0))
     offline_loss_type = _get(config, "offline_loss_type", "sft")
@@ -112,6 +177,13 @@ def apply_hpt(
         raise ValueError("hpt.off_policy_beta must be positive")
     scores = reward_tensor.sum(dim=-1)
     uids = batch.non_tensor_batch["uid"]
+    metrics = _compute_batch_metrics(
+        scores,
+        uids,
+        success_reward=success_reward,
+        failure_reward=failure_reward,
+        format_reward=format_reward,
+    )
 
     solved_groups = 0
     sft_groups = 0
@@ -192,13 +264,16 @@ def apply_hpt(
     del dp_size
     pad_size = 0
 
-    metrics = {
-        "hpt/sft_groups": float(sft_groups),
-        "hpt/rl_groups": float(len(set(uids.tolist())) - sft_groups),
-        "hpt/solved_groups": float(solved_groups),
-        "hpt/sft_sequences": float(sft_mask.sum().item()),
-        "hpt/valid_sequences": float(len(keep)),
-        "hpt/padded_sequences": float(pad_size),
-        "hpt/offline_mode": float(offline_modes[offline_loss_type]),
-    }
+    metrics.update(_compute_on_off_metrics(selected, selected_rewards, prefix_mask))
+    metrics.update(
+        {
+            "hpt/sft_groups": float(sft_groups),
+            "hpt/rl_groups": float(len(set(uids.tolist())) - sft_groups),
+            "hpt/solved_groups": float(solved_groups),
+            "hpt/sft_sequences": float(sft_mask.sum().item()),
+            "hpt/valid_sequences": float(len(keep)),
+            "hpt/padded_sequences": float(pad_size),
+            "hpt/offline_mode": float(offline_modes[offline_loss_type]),
+        }
+    )
     return selected, selected_rewards, metrics

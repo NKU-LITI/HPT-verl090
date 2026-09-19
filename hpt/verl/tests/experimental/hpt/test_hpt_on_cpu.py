@@ -20,7 +20,7 @@ from verl.experimental.hpt.actor_update import (
     legacy_gradient_accumulation,
     scale_legacy_backward_loss,
 )
-from verl.experimental.hpt.algorithm import apply_hpt
+from verl.experimental.hpt.algorithm import _compute_batch_metrics, apply_hpt
 from verl.experimental.hpt.dataset import _strip_duplicate_think_prefix, _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_hpt_batch_like_reference
@@ -35,10 +35,12 @@ from verl.trainer.ppo.ray_trainer import (
     _hpt_legacy_gradient_accumulation,
 )
 from verl.utils import tensordict_utils as tu
+from verl.utils.metric import AggregationType
 from verl.utils.seqlen_balancing import rearrange_micro_batches_hpt_legacy
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 from verl.workers.engine.utils import prepare_micro_batches
 from verl.workers.engine_workers import _select_valid_rows
+from verl.workers.utils.losses import ppo_loss
 
 
 class _Tokenizer:
@@ -422,6 +424,7 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
     )
     trainer.distillation_config = None
     captured = []
+    outputs = []
 
     class _ActorWorkerGroup:
         def update_actor(self, data):
@@ -436,13 +439,22 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
                     "max_grad_norm": tu.get(data, "hpt_legacy_max_grad_norm"),
                 }
             )
-            return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": {"mfu": 0.0}})
+            return tu.get_tensordict(
+                tensor_dict={},
+                non_tensor_dict={
+                    "metrics": {
+                        "mfu": 0.0,
+                        "loss": [999.0],
+                        "hpt/legacy_actor_loss": [0.25],
+                    }
+                },
+            )
 
     trainer.actor_rollout_wg = _ActorWorkerGroup()
     for routed_rows in (2, 4):
         batch = _batch().select_idxs(list(range(routed_rows)))
         batch.batch["hpt_valid_mask"] = torch.ones(routed_rows, dtype=torch.bool)
-        trainer._update_actor(batch)
+        outputs.append(trainer._update_actor(batch).meta_info["metrics"])
 
     assert captured == [
         {
@@ -464,6 +476,67 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
             "max_grad_norm": 80.0,
         },
     ]
+    for output in outputs:
+        assert output["actor/loss"] == [0.25]
+        assert "actor/hpt/legacy_actor_loss" not in output
+
+
+def test_hpt_tensorboard_losses_use_legacy_mean_reduction():
+    config = OmegaConf.create(
+        {
+            "global_batch_info": {},
+            "policy_loss": {
+                "loss_mode": "hpt",
+                "loss_remove_clip": True,
+                "loss_remove_token_mean": True,
+            },
+            "loss_agg_mode": "token-mean",
+            "loss_scale_factor": None,
+            "clip_ratio": 0.2,
+            "clip_ratio_low": 0.2,
+            "clip_ratio_high": 0.2,
+            "clip_ratio_c": 3.0,
+            "entropy_coeff": 0.001,
+            "use_kl_loss": False,
+        }
+    )
+    data = TensorDict(
+        {
+            "prompts": torch.tensor([[1], [1]]),
+            "responses": torch.tensor([[2, 3], [2, 3]]),
+            "attention_mask": torch.ones(2, 3, dtype=torch.long),
+            "response_mask": torch.ones(2, 2, dtype=torch.bool),
+            "old_log_probs": torch.zeros(2, 2),
+            "advantages": torch.tensor([[1.0, 1.0], [-1.0, -1.0]]),
+            "hpt_sft_mask": torch.tensor([False, True]),
+            "hpt_valid_mask": torch.tensor([True, True]),
+            "hpt_sft_weight": torch.ones(2),
+            "hpt_offline_mode": torch.zeros(2, dtype=torch.long),
+        },
+        batch_size=[2],
+    )
+    tu.assign_non_tensor(
+        data,
+        dp_size=2,
+        batch_num_tokens=4,
+        global_batch_size=256,
+        max_response_len=2,
+        hpt_legacy_gradient_accumulation=32,
+    )
+    model_output = {
+        # Two full sequences of length three. no_padding_2_padding extracts
+        # the first two entries from each sequence as response log-probs.
+        "log_probs": torch.tensor([-0.1, -0.2, 9.0, -0.3, -0.4, 9.0]),
+        "entropy": torch.tensor([0.5, 0.6, 9.0, 0.7, 0.8, 9.0]),
+    }
+
+    loss, metrics = ppo_loss(config, model_output, data)
+
+    assert metrics["actor/pg_loss"].aggregation is AggregationType.MEAN
+    assert metrics["actor/entropy_loss"].aggregation is AggregationType.MEAN
+    legacy_actor_loss = metrics["hpt/legacy_actor_loss"]
+    assert legacy_actor_loss.aggregation is AggregationType.MEAN
+    assert legacy_actor_loss.values == [loss.detach().item() / 32]
 
 
 def test_hpt_actor_update_legacy_scale_and_skip_boundaries():
@@ -651,6 +724,37 @@ def test_switch_matches_legacy_post_selector_order_before_padding():
     assert output_reward.shape == (3, 3)
     assert metrics["hpt/sft_groups"] == 1
     assert metrics["hpt/rl_groups"] == 1
+    assert metrics["batch/solve_none"] == 1
+    assert metrics["batch/solve_none_format"] == 0
+    assert metrics["batch/solve_all"] == 0
+    assert metrics["batch/solved"] == 0.25
+    assert metrics["batch/failed"] == 0.75
+    assert metrics["on_off_metrics/on_response_length_mean"] == 2.0
+    assert metrics["on_off_metrics/off_response_length_mean"] == 3.0
+    assert metrics["on_off_metrics/on_score"] == 0.5
+    assert metrics["on_off_metrics/off_score"] == 1.0
+    assert np.isclose(metrics["on_off_metrics/off_example_ratio"], 1 / 3)
+
+
+def test_hpt_batch_metrics_classify_uniform_reward_groups():
+    scores = torch.tensor([0.0, 0.0, 1.0, 1.0, -1.0, -1.0, 1.0, 0.0])
+    uids = np.array(["failed"] * 2 + ["solved"] * 2 + ["format"] * 2 + ["mixed"] * 2)
+
+    metrics = _compute_batch_metrics(
+        scores,
+        uids,
+        success_reward=1.0,
+        failure_reward=0.0,
+        format_reward=-1.0,
+    )
+
+    assert metrics == {
+        "batch/solve_none": 1.0,
+        "batch/solve_none_format": 1.0,
+        "batch/solve_all": 1.0,
+        "batch/solved": 3 / 8,
+        "batch/failed": 3 / 8,
+    }
 
 
 def test_hpt_final_padding_and_balance_match_legacy_layout():

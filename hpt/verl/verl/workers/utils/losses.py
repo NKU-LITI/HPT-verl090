@@ -61,6 +61,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     if entropy is not None:
         entropy = no_padding_2_padding(entropy, data)
 
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    hpt_gradient_accumulation = tu.get_non_tensor_data(data=data, key="hpt_legacy_gradient_accumulation", default=None)
+
     # global batch info for loss aggregation
     config.global_batch_info["dp_size"] = data["dp_size"]
     config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
@@ -79,6 +82,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metric_aggregation = AggregationType.SUM
     else:
         metric_aggregation = AggregationType.MEAN
+
+    # The legacy HPT actor logged the mean of the independently normalized
+    # micro-batch objectives.  SUM is correct for stock verl losses that are
+    # normalized using global_batch_info, but HPT deliberately ignores that
+    # normalization to reproduce the 0.1 objective.  Using SUM here makes the
+    # displayed loss depend on the dynamic micro-batch packing count even
+    # though the backward objective is unchanged.
+    policy_metric_aggregation = AggregationType.MEAN if loss_mode == "hpt" else metric_aggregation
 
     metrics = {}
 
@@ -110,8 +121,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_agg_mode = config.loss_agg_mode
 
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
-
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     hpt_kwargs = {}
     if loss_mode == "hpt":
@@ -140,7 +149,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
 
     metrics.update(pg_metrics)
-    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=policy_metric_aggregation)
     policy_loss = pg_loss
 
     # add entropy loss
@@ -157,7 +166,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
             )
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
-        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
+        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=policy_metric_aggregation)
 
     # add kl loss
     if config.use_kl_loss:
@@ -171,6 +180,16 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    if loss_mode == "hpt" and hpt_gradient_accumulation is not None:
+        # 0.1 logged ``policy_loss / gradient_accumulation`` as actor/loss.
+        # Keep this as a transient metric; RayPPOTrainer promotes it to the
+        # standard ``actor/loss`` key after discarding the engine's summed
+        # diagnostic loss.  This does not participate in backward.
+        metrics["hpt/legacy_actor_loss"] = Metric(
+            value=policy_loss / hpt_gradient_accumulation,
+            aggregation=AggregationType.MEAN,
+        )
 
     from verl.utils.hpt_debug_dump import dump_boundary as _hpt_dump_boundary
 
