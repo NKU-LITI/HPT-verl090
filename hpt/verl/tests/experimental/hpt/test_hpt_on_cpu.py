@@ -739,6 +739,25 @@ def test_off_policy_and_srft_modes_are_finite():
         assert torch.isfinite(log_prob.grad).all()
 
 
+def test_dft_mode_matches_legacy_probability_weighted_nll():
+    log_prob = torch.tensor([[-0.2, -0.7], [-0.4, -0.8]], requires_grad=True)
+    response_mask = torch.ones_like(log_prob, dtype=torch.bool)
+    target_rows = torch.tensor([True, False])
+    loss, metrics = compute_policy_loss_hpt(
+        old_log_prob=log_prob.detach(),
+        log_prob=log_prob,
+        advantages=torch.zeros_like(log_prob),
+        response_mask=response_mask,
+        config=OmegaConf.create({"clip_ratio": 0.2, "policy_loss": {}}),
+        hpt_sft_mask=target_rows,
+        hpt_offline_mode=torch.full((2,), 3),
+    )
+
+    expected = (-torch.exp(log_prob[0]).detach() * log_prob[0]).mean()
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(torch.tensor(metrics["hpt/sft_loss"]), expected.detach())
+
+
 def test_grpo_compat_removes_clip_and_valid_token_mean():
     old_log_prob = torch.zeros(2, 3)
     log_prob = torch.log(torch.tensor([[2.0, 0.5, 4.0], [0.4, 1.5, 2.0]])).requires_grad_()

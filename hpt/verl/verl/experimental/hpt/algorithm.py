@@ -101,7 +101,7 @@ def apply_hpt(
     switch_gate = int(_get(config, "switch_gate", 0))
     sft_loss_coef = float(_get(config, "sft_loss_coef", 1.0))
     offline_loss_type = _get(config, "offline_loss_type", "sft")
-    offline_modes = {"sft": 0, "off_policy": 1, "srft": 2}
+    offline_modes = {"sft": 0, "off_policy": 1, "srft": 2, "dft": 3}
     if offline_loss_type not in offline_modes:
         raise ValueError(
             f"Unsupported HPT offline_loss_type {offline_loss_type!r}; "

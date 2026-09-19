@@ -56,11 +56,12 @@ def compute_policy_loss_hpt(
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Reproduce the old HPT actor objective for one fixed micro-batch.
 
-    Modes 0 (SFT + on-policy) and 1 (combined on/off-policy) follow the
-    original HPT formulas. In particular, their canonical configuration
-    disables ratio clipping and divides the masked RL token sum by the padded
-    response width. No verl 0.9 global-batch aggregation is used here; the old
-    actor normalized each micro-batch before its separate backward call.
+    Modes 0 (SFT + on-policy), 1 (combined on/off-policy), and 3 (DFT +
+    on-policy) follow the original HPT formulas. In particular, their
+    canonical configuration disables ratio clipping and divides the masked RL
+    token sum by the padded response width. No verl 0.9 global-batch
+    aggregation is used here; the old actor normalized each micro-batch before
+    its separate backward call.
     """
     del loss_agg_mode
     if hpt_sft_mask is None:
@@ -80,7 +81,7 @@ def compute_policy_loss_hpt(
         if modes.numel() != 1:
             raise ValueError(f"HPT batch contains multiple offline loss modes: {modes.tolist()}")
         mode = int(modes.item())
-    if mode not in {0, 1, 2}:
+    if mode not in {0, 1, 2, 3}:
         raise ValueError(f"Unknown HPT offline loss mode id: {mode}")
 
     zero = log_prob.sum() * 0.0
@@ -156,15 +157,21 @@ def compute_policy_loss_hpt(
 
     sft_loss = zero
     off_policy_loss = zero
-    if mode == 0:
+    if mode in {0, 3}:
         if remove_token_mean:
             rl_loss = (on_token_loss * on_token_mask).sum() / response_width
         else:
             rl_loss = _masked_mean_or_zero(on_token_loss, on_token_mask)
 
-        if target_rows.any():
+        if target_rows.any() and mode == 0:
             token_weights = 1.0 if hpt_sft_weight is None else hpt_sft_weight[:, None]
             sft_loss = _masked_mean_or_zero(-log_prob * token_weights, target_token_mask)
+
+        if target_rows.any() and mode == 3:
+            # Legacy DFT objective from the verl 0.7 HPT implementation:
+            # -stopgrad(pi_theta) * log(pi_theta).
+            token_weights = torch.exp(log_prob).detach()
+            sft_loss = _masked_mean_or_zero(-token_weights * log_prob, target_token_mask)
 
         loss = rl_loss + sft_loss
     else:
@@ -184,12 +191,12 @@ def compute_policy_loss_hpt(
         # the old combined-token matrix before its single normalization.
         loss = rl_loss + off_policy_loss
 
-    clip_mask = on_token_mask if mode == 0 else effective_mask
+    clip_mask = on_token_mask if mode in {0, 3} else effective_mask
     pg_clipfrac = _masked_mean_or_zero(
         torch.gt(on_losses_clipped, on_losses_unclipped).float(),
         clip_mask,
     )
-    ppo_kl_mask = on_token_mask if mode == 0 else effective_mask
+    ppo_kl_mask = on_token_mask if mode in {0, 3} else effective_mask
     ppo_kl = _masked_mean_or_zero(-log_ratio, ppo_kl_mask)
     metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
