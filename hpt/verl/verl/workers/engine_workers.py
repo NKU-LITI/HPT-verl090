@@ -65,7 +65,12 @@ def _select_valid_rows(data: TensorDict, valid_mask_key: str | None) -> TensorDi
     valid_mask = tu.get(data, key=valid_mask_key)
     if valid_mask is None:
         raise KeyError(f"valid-row mask {valid_mask_key!r} is missing from the actor batch")
-    return data[valid_mask.bool()]
+    # TensorDict's boolean indexing delegates to aten.index.Tensor for every
+    # field, which is unsupported for jagged NestedTensor fields produced by
+    # the 0.9 async rollout path.  The protocol helper preserves nested layout
+    # while selecting exactly the same valid row indices.
+    valid_indices = valid_mask.bool().nonzero(as_tuple=False).flatten()
+    return tu.index_select_tensor_dict(data, valid_indices)
 
 
 def _with_routing_replay_flag(enabled: bool):

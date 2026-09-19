@@ -6,27 +6,19 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Binary math verifier used by the migrated HPT recipe."""
+"""Canonical verl 0.1 HPT reward compatibility wrapper."""
 
 from __future__ import annotations
 
-from verl.utils.reward_score.math_verify import compute_score as math_verify_score
-from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+from verl.experimental.hpt.legacy_entropy_math import compute_score as legacy_entropy_math_score
+
+
+def legacy_reward_input(solution_str: str) -> str:
+    """Reproduce ``RewardManager``'s reward_impl_version=6 text prefix."""
+    return "<think>\n" + solution_str
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
-    """Return the binary 0/1 verifier signal expected by HPT's switch gate."""
+    """Run the exact entropy_math verifier selected by canonical HPT."""
     del data_source, extra_info, kwargs
-    references = ground_truth if isinstance(ground_truth, (list, tuple)) else [ground_truth]
-    result = 0.0
-    for reference in references:
-        reference = str(reference)
-        boxed = last_boxed_only_string(reference)
-        if boxed is not None:
-            reference = remove_boxed(boxed)
-        result = max(result, math_verify_score(model_output=solution_str, ground_truth=reference))
-    if isinstance(result, tuple):
-        result = result[0]
-    if isinstance(result, dict):
-        result = result["score"]
-    return float(bool(result))
+    return float(bool(legacy_entropy_math_score(legacy_reward_input(solution_str), ground_truth)))

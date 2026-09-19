@@ -17,6 +17,8 @@ import torch
 from omegaconf import DictConfig
 
 from verl import DataProto
+from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
+from verl.experimental.hpt.reward_manager import decode_legacy_response
 from verl.utils.model import compute_position_id_with_mask
 
 
@@ -29,7 +31,9 @@ def _tokenize_target(tokenizer, target: str, response_width: int) -> tuple[torch
     if token_ids and isinstance(token_ids[0], list):
         token_ids = token_ids[0]
     eos_id = tokenizer.eos_token_id
-    if eos_id is not None and (not token_ids or token_ids[-1] != eos_id):
+    # The reference off-policy rollout appends EOS unconditionally and then
+    # truncates the complete response to the configured response width.
+    if eos_id is not None:
         token_ids.append(eos_id)
     token_ids = token_ids[:response_width]
     if not token_ids:
@@ -144,12 +148,22 @@ def apply_hpt(
     selected_rewards = reward_tensor[torch.tensor(keep, device=reward_tensor.device)]
     sft_mask = torch.tensor([source in sft_source_rows for source in keep], dtype=torch.bool)
     valid_mask = torch.ones(len(keep), dtype=torch.bool)
+    prefix_mask = torch.zeros_like(selected.batch["response_mask"], dtype=torch.bool)
 
     for row in torch.nonzero(sft_mask, as_tuple=False).flatten().tolist():
         _replace_with_target(selected, row, tokenizer)
+        prefix_mask[row] = selected.batch["response_mask"][row].bool()
+        valid_response_length = int(selected.batch["response_mask"][row].sum().item())
+        valid_response_ids = selected.batch["responses"][row, :valid_response_length]
+        decoded_response = decode_legacy_response(tokenizer, valid_response_ids)
+        reward_model = selected.non_tensor_batch["reward_model"][row]
+        target_reward = compute_hpt_reward(
+            data_source=selected.non_tensor_batch["data_source"][row],
+            solution_str=decoded_response,
+            ground_truth=reward_model["ground_truth"],
+        )
         selected_rewards[row].zero_()
-        last_token = int(selected.batch["response_mask"][row].sum().item()) - 1
-        selected_rewards[row, last_token] = success_reward
+        selected_rewards[row, valid_response_length - 1] = target_reward
 
     # Demonstrations do not have rollout-policy log probabilities.  verl will
     # recompute old_log_probs for the complete transformed batch below.
@@ -158,6 +172,7 @@ def apply_hpt(
             selected.batch.pop(key)
 
     selected.batch["hpt_sft_mask"] = sft_mask.to(selected.batch.device)
+    selected.batch["prefix_mask"] = prefix_mask.to(selected.batch.device)
     selected.batch["hpt_sft_weight"] = torch.full(
         (len(selected),), sft_loss_coef, dtype=torch.float32, device=selected.batch.device
     )

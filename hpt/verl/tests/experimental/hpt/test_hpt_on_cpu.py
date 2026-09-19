@@ -6,6 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
@@ -20,10 +21,13 @@ from verl.experimental.hpt.actor_update import (
     scale_legacy_backward_loss,
 )
 from verl.experimental.hpt.algorithm import apply_hpt
-from verl.experimental.hpt.dataset import _target_to_text
+from verl.experimental.hpt.dataset import _strip_duplicate_think_prefix, _target_to_text
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_hpt_batch_like_reference
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
+from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
+from verl.experimental.hpt.reward import legacy_reward_input
+from verl.experimental.hpt.reward_manager import decode_legacy_response
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _attach_hpt_reward,
@@ -44,6 +48,10 @@ class _Tokenizer:
     def __call__(self, text, **kwargs):
         del kwargs
         return {"input_ids": [10 + len(text), 11]}
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del token_ids
+        return "reasoning \\boxed{1}" + ("" if skip_special_tokens else "<eos>")
 
 
 class _ActorConfig:
@@ -325,6 +333,8 @@ def _batch():
         non_tensor_batch={
             "uid": np.array(["a", "a", "b", "b"], dtype=object),
             "hpt_target": np.array(["A", "A", "B", "B"], dtype=object),
+            "data_source": np.array(["math"] * 4, dtype=object),
+            "reward_model": np.array([{"ground_truth": "1"}] * 4, dtype=object),
         },
     )
 
@@ -334,6 +344,24 @@ def test_target_normalization():
     assert _target_to_text({"role": "assistant", "content": "answer"}) == "answer"
     assert _target_to_text([{"role": "assistant", "content": "answer"}]) == "answer"
     assert _target_to_text(np.array([{"role": "assistant", "content": "answer"}], dtype=object)) == "answer"
+    assert _strip_duplicate_think_prefix("prompt<think>\n", "<think>\nanswer") == "answer"
+    assert _strip_duplicate_think_prefix("prompt", "<think>\nanswer") == "<think>\nanswer"
+
+
+def test_hpt_reward_uses_legacy_entropy_math_and_text_prefix():
+    assert legacy_reward_input("reasoning \\boxed{1}<eos>") == "<think>\nreasoning \\boxed{1}<eos>"
+    assert compute_hpt_reward("math", "reasoning \\boxed{1}<eos>", "1") == 1.0
+    assert compute_hpt_reward("math", "reasoning \\boxed{2}<eos>", "1") == 0.0
+    assert compute_hpt_reward("math", "answer is 1", "1") == 0.0
+    assert decode_legacy_response(_Tokenizer(), torch.tensor([7, 2])) == "reasoning \\boxed{1}<eos>"
+
+
+def test_hpt_reward_is_compatible_with_async_reward_loop_thread_pool():
+    # RewardManagerBase.run_single dispatches synchronous scorers through
+    # run_in_executor; legacy SIGALRM guards must not make that path unusable.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(compute_hpt_reward, "math", "reasoning \\boxed{1}<eos>", "1").result()
+    assert result == 1.0
 
 
 def test_gen_batch_keeps_target_on_driver_batch():
@@ -517,6 +545,27 @@ def test_hpt_padding_is_removed_before_partial_mini_batch_split():
     assert torch.equal(mini_batches[1]["row_id"], torch.arange(128, 130))
 
 
+def test_hpt_padding_selection_supports_async_rollout_nested_tensors():
+    nested = torch.nested.as_nested_tensor(
+        [torch.tensor([10, 11]), torch.tensor([20]), torch.tensor([30, 31, 32])],
+        layout=torch.jagged,
+    )
+    data = TensorDict(
+        {
+            "nested_ids": nested,
+            "row_id": torch.arange(3),
+            "hpt_valid_mask": torch.tensor([True, False, True]),
+        },
+        batch_size=[3],
+    )
+
+    selected = _select_valid_rows(data, "hpt_valid_mask")
+
+    assert selected["row_id"].tolist() == [0, 2]
+    assert selected["nested_ids"].is_nested
+    assert [row.tolist() for row in selected["nested_ids"].unbind()] == [[10, 11], [30, 31, 32]]
+
+
 def _partition_batch(lengths, valid_mask=None):
     width = 10
     attention_mask = torch.zeros(len(lengths), width, dtype=torch.long)
@@ -597,6 +646,8 @@ def test_switch_matches_legacy_post_selector_order_before_padding():
     assert output.non_tensor_batch["uid"].tolist() == ["b", "b", "a"]
     assert output.batch["hpt_sft_mask"].tolist() == [False, False, True]
     assert output.batch["hpt_valid_mask"].tolist() == [True, True, True]
+    assert output.batch["prefix_mask"].tolist() == [[False] * 3, [False] * 3, [True] * 3]
+    assert output_reward.sum(dim=-1).tolist() == [1.0, 0.0, 1.0]
     assert output_reward.shape == (3, 3)
     assert metrics["hpt/sft_groups"] == 1
     assert metrics["hpt/rl_groups"] == 1

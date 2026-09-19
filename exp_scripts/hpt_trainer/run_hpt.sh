@@ -27,6 +27,8 @@ OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-sft}
 SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
 OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
 
+# The 0.1 constant-schedule lambda starts at LR=0 even with zero configured
+# warmup; one explicit 0.9 warmup step preserves that first-step sequence.
 python3 -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   algorithm.norm_adv_by_std_in_grpo=False \
@@ -36,13 +38,14 @@ python3 -m verl.trainer.main_ppo \
   data.val_files="${VAL_FILES}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
   data.max_prompt_length=1024 \
-  data.max_response_length=8192 \
+  data.max_response_length=4096 \
   data.custom_cls.path="${VERL_ROOT}/verl/experimental/hpt/dataset.py" \
   data.custom_cls.name=HPTDataset \
   +data.target_key=target \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.actor.optim.lr="${LR}" \
+  actor_rollout_ref.actor.optim.lr_warmup_steps=1 \
   actor_rollout_ref.actor.optim.clip_grad=1.0 \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_mini_batch_size=32 \
@@ -69,6 +72,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
   reward.custom_reward_function.path="${VERL_ROOT}/verl/experimental/hpt/reward.py" \
   reward.custom_reward_function.name=compute_score \
+  reward.reward_manager.source=importlib \
+  reward.reward_manager.name=LegacyHPTRewardManager \
+  reward.reward_manager.module.path="${VERL_ROOT}/verl/experimental/hpt/reward_manager.py" \
   +hpt.enabled=True \
   +hpt.strategy="${HPT_STRATEGY}" \
   +hpt.switch_gate="${SWITCH_GATE}" \
