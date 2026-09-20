@@ -7,12 +7,14 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tensordict import TensorDict
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
 from verl.experimental.hpt.actor_update import (
@@ -21,7 +23,12 @@ from verl.experimental.hpt.actor_update import (
     scale_legacy_backward_loss,
 )
 from verl.experimental.hpt.algorithm import _compute_batch_metrics, apply_hpt
-from verl.experimental.hpt.dataset import _strip_duplicate_think_prefix, _target_to_text
+from verl.experimental.hpt.dataset import (
+    HPTLegacyRandomSampler,
+    _strip_duplicate_think_prefix,
+    _target_to_text,
+    create_hpt_train_sampler,
+)
 from verl.experimental.hpt.grpo import compute_policy_loss_grpo_compat
 from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_hpt_batch_like_reference
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
@@ -41,6 +48,52 @@ from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 from verl.workers.engine.utils import prepare_micro_batches
 from verl.workers.engine_workers import _select_valid_rows
 from verl.workers.utils.losses import ppo_loss
+
+
+def test_hpt_fsdp_syncs_each_dynamic_micro_batch(monkeypatch):
+    """Legacy HPT must not enter the stock FSDP ``no_sync`` path."""
+    import verl.workers.engine.fsdp.transformer_impl as fsdp_impl
+
+    engine = FSDPEngine.__new__(FSDPEngine)
+    engine.scaler = None
+    engine.ulysses_sequence_parallel_size = 1
+    engine._hpt_legacy_max_grad_norm = None
+    engine.get_data_parallel_group = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+
+    sync_context_calls = []
+
+    @contextmanager
+    def tracked_sync_context(*, is_last_micro_batch):
+        sync_context_calls.append(is_last_micro_batch)
+        yield
+
+    engine._gradient_sync_context = tracked_sync_context
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    engine.forward_step = lambda micro_batch, loss_function, forward_only: (
+        parameter * micro_batch["value"].sum(),
+        {},
+    )
+
+    micro_batches = [
+        TensorDict({"value": torch.tensor([1.0])}, batch_size=[1]),
+        TensorDict({"value": torch.tensor([2.0])}, batch_size=[1]),
+    ]
+    monkeypatch.setattr(fsdp_impl, "prepare_micro_batches", lambda **kwargs: (micro_batches, None))
+    monkeypatch.setattr(fsdp_impl, "postprocess_batch_func", lambda **kwargs: kwargs["output_lst"])
+    monkeypatch.setattr(fsdp_impl, "get_device_id", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+
+    data = TensorDict({"loss_mask": torch.ones(1, 1)}, batch_size=[1])
+    tu.assign_non_tensor(
+        data,
+        hpt_legacy_gradient_accumulation=2,
+        hpt_legacy_max_grad_norm=80.0,
+    )
+    engine.forward_backward_batch(data, loss_function=lambda *args: None)
+
+    assert sync_context_calls == []
+    torch.testing.assert_close(parameter.grad, torch.tensor(1.5))
 
 
 class _Tokenizer:
@@ -90,6 +143,111 @@ class _GRPOActorConfig(_ActorConfig):
             remove_token_mean=remove_token_mean,
         )
         self.global_batch_info = {}
+
+
+def test_hpt_sampler_first_permutation_matches_verl010_exactly():
+    sampler = HPTLegacyRandomSampler(range(25367), seed=47)
+    assert [next(iter(sampler)) for _ in range(10)] == [
+        2350,
+        11445,
+        21176,
+        11239,
+        21115,
+        5886,
+        5300,
+        15838,
+        16935,
+        1183,
+    ]
+
+
+def test_hpt_sampler_iterator_construction_does_not_advance_rng_or_rows():
+    sampler = HPTLegacyRandomSampler(range(32), seed=47)
+    expected = torch.randperm(32, generator=torch.Generator().manual_seed(47)).tolist()
+
+    first_iterator = iter(sampler)
+    second_iterator = iter(sampler)
+    # Creating either generator executes none of the sampler body.  Once used,
+    # both generators advance the same legacy sampler cursor.
+    assert next(second_iterator) == expected[0]
+    assert next(first_iterator) == expected[1]
+    assert list(iter(sampler)) == expected[2:]
+
+
+def test_hpt_sampler_stateful_dataloader_resume_preserves_next_batch():
+    dataset = list(range(97))
+    loader = StatefulDataLoader(
+        dataset,
+        batch_size=8,
+        sampler=HPTLegacyRandomSampler(dataset, seed=47),
+        num_workers=0,
+        drop_last=True,
+    )
+    iterator = iter(loader)
+    for _ in range(3):
+        next(iterator)
+    state = loader.state_dict()
+    expected_next_batch = next(iterator)
+
+    resumed_loader = StatefulDataLoader(
+        dataset,
+        batch_size=8,
+        sampler=HPTLegacyRandomSampler(dataset, seed=47),
+        num_workers=0,
+        drop_last=True,
+    )
+    resumed_loader.load_state_dict(state)
+    actual_next_batch = next(iter(resumed_loader))
+    torch.testing.assert_close(actual_next_batch, expected_next_batch)
+
+
+def test_hpt_sampler_resume_at_epoch_boundary_starts_next_permutation():
+    dataset = list(range(17))
+    loader_kwargs = {"batch_size": 4, "num_workers": 0, "drop_last": True}
+    loader = StatefulDataLoader(dataset, sampler=HPTLegacyRandomSampler(dataset, seed=47), **loader_kwargs)
+    list(loader)
+    state = loader.state_dict()
+    expected_first_batch_next_epoch = next(iter(loader))
+
+    resumed_loader = StatefulDataLoader(
+        dataset,
+        sampler=HPTLegacyRandomSampler(dataset, seed=47),
+        **loader_kwargs,
+    )
+    resumed_loader.load_state_dict(state)
+    actual_first_batch_next_epoch = next(iter(resumed_loader))
+    torch.testing.assert_close(actual_first_batch_next_epoch, expected_first_batch_next_epoch)
+
+
+def test_hpt_sampler_factory_keeps_non_shuffled_order():
+    sampler = create_hpt_train_sampler(OmegaConf.create({"shuffle": False, "seed": 47}), range(8))
+    assert list(sampler) == list(range(8))
+
+
+def test_hpt_trainer_replaces_preconstructed_verl090_sampler():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "hpt": {"enabled": True},
+            "trainer": {"total_epochs": 1, "total_training_steps": None},
+            "data": {
+                "shuffle": True,
+                "seed": 47,
+                "train_batch_size": 4,
+                "val_batch_size": 4,
+                "dataloader_num_workers": 0,
+                "validation_shuffle": False,
+            },
+        }
+    )
+    stock_sampler = torch.utils.data.SequentialSampler(range(16))
+    trainer._create_dataloader(
+        train_dataset=list(range(16)),
+        val_dataset=list(range(8)),
+        collate_fn=lambda rows: rows,
+        train_sampler=stock_sampler,
+    )
+    assert isinstance(trainer.train_dataloader.sampler, HPTLegacyRandomSampler)
 
 
 def _reference_hpt_fixed_microbatch(

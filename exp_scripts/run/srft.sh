@@ -86,6 +86,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.seed=0 \
+    actor_rollout_ref.rollout.max_num_seqs=1024 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.max_model_len=5120 \
     actor_rollout_ref.rollout.n=8 \

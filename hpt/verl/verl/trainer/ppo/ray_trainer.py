@@ -420,7 +420,15 @@ class RayPPOTrainer:
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
-        if train_sampler is None:
+        hpt_config = self.config.get("hpt")
+        if hpt_config is not None and hpt_config.get("enabled", False):
+            # main_ppo_v0 constructs the stock 0.9 sampler before instantiating
+            # the trainer.  HPT must replace it here to recover the 0.1 row
+            # order; checking only ``train_sampler is None`` would be a no-op.
+            from verl.experimental.hpt.dataset import create_hpt_train_sampler
+
+            train_sampler = create_hpt_train_sampler(self.config.data, self.train_dataset)
+        elif train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
@@ -1132,7 +1140,9 @@ class RayPPOTrainer:
         if os.path.exists(dataloader_local_path):
             steps_per_epoch = len(self.train_dataloader)
             at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
-            if at_epoch_boundary:
+            hpt_config = self.config.get("hpt")
+            hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
+            if at_epoch_boundary and not hpt_enabled:
                 print(
                     f"Skipping dataloader state restore: global_steps={self.global_steps} "
                     f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "

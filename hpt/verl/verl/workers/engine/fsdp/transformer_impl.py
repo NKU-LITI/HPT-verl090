@@ -732,9 +732,18 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            # The verl 0.1 HPT actor called ``loss.backward()`` directly for
+            # every dynamic micro-batch.  FSDP therefore reduced gradients on
+            # every backward call.  Stock 0.9 deliberately uses ``no_sync``
+            # for all but the final micro-batch, which is mathematically
+            # equivalent in exact arithmetic but changes the distributed
+            # accumulation/reduction order.  HPT training is highly
+            # path-dependent, so preserve the legacy synchronization boundary
+            # instead of applying the stock communication optimization.
+            hpt_sync_every_micro_batch = hpt_gradient_accumulation is not None
             sync_ctx = (
                 nullcontext()
-                if forward_only
+                if forward_only or hpt_sync_every_micro_batch
                 else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
             )
             with ctx, sync_ctx:
