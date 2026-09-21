@@ -376,6 +376,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
             data, key="hpt_legacy_gradient_accumulation", default=None
         ) is not None
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
+        hpt_optimizer_lr_used = None
+        if hpt_legacy_control:
+            optimizer = getattr(self.engine, "optimizer", None)
+            if optimizer is not None and optimizer.param_groups:
+                # Capture before optimizer_step.  The ordinary ``lr`` metric is
+                # read after scheduler.step(), which hid the erroneous one-step
+                # warmup by reporting 5e-6 even though step 1 used LR=0.
+                hpt_optimizer_lr_used = float(optimizer.param_groups[0]["lr"])
 
         # inject engineering parameters if not specified
         default_keys = dict(
@@ -418,6 +426,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
+            if hpt_optimizer_lr_used is not None:
+                output["metrics"]["hpt/optimizer_lr_used"] = Metric(
+                    aggregation="mean",
+                    value=hpt_optimizer_lr_used,
+                )
             final_output = self._postprocess_output(
                 output,
                 global_token_num=global_token_num,

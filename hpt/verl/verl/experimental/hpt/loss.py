@@ -20,6 +20,8 @@ from typing import Any, Optional
 
 import torch
 
+from verl.mix_src.legacy_policy_loss import compute_policy_loss as compute_v01_policy_loss
+from verl.mix_src.legacy_policy_loss import compute_sft_pure_loss as compute_v01_sft_pure_loss
 from verl.trainer.ppo.core_algos import register_policy_loss
 from verl.utils.torch_functional import masked_mean
 from verl.workers.config import ActorConfig
@@ -157,15 +159,32 @@ def compute_policy_loss_hpt(
 
     sft_loss = zero
     off_policy_loss = zero
+    used_v01_policy_source = False
     if mode in {0, 3}:
-        if remove_token_mean:
+        # The canonical HPT path executes the old function body directly.  The
+        # manual 0.9 path remains only for optional rollout importance weights,
+        # which did not exist in verl 0.1.
+        if rollout_is_weights is None and on_rows.any():
+            rl_loss, pg_clipfrac, ppo_kl = compute_v01_policy_loss(
+                old_log_prob=old_log_prob[on_rows],
+                log_prob=log_prob[on_rows],
+                advantages=advantages[on_rows],
+                eos_mask=effective_mask[on_rows],
+                cliprange=config.clip_ratio,
+                loss_remove_token_mean=remove_token_mean,
+                loss_remove_clip=remove_clip,
+            )
+            used_v01_policy_source = True
+        elif remove_token_mean:
             rl_loss = (on_token_loss * on_token_mask).sum() / response_width
         else:
             rl_loss = _masked_mean_or_zero(on_token_loss, on_token_mask)
 
         if target_rows.any() and mode == 0:
-            token_weights = 1.0 if hpt_sft_weight is None else hpt_sft_weight[:, None]
-            sft_loss = _masked_mean_or_zero(-log_prob * token_weights, target_token_mask)
+            target_log_prob = log_prob[target_rows]
+            if hpt_sft_weight is not None:
+                target_log_prob = target_log_prob * hpt_sft_weight[target_rows, None]
+            sft_loss = compute_v01_sft_pure_loss(target_log_prob, effective_mask[target_rows])
 
         if target_rows.any() and mode == 3:
             # Legacy DFT objective from the verl 0.7 HPT implementation:
@@ -191,13 +210,14 @@ def compute_policy_loss_hpt(
         # the old combined-token matrix before its single normalization.
         loss = rl_loss + off_policy_loss
 
-    clip_mask = on_token_mask if mode in {0, 3} else effective_mask
-    pg_clipfrac = _masked_mean_or_zero(
-        torch.gt(on_losses_clipped, on_losses_unclipped).float(),
-        clip_mask,
-    )
-    ppo_kl_mask = on_token_mask if mode in {0, 3} else effective_mask
-    ppo_kl = _masked_mean_or_zero(-log_ratio, ppo_kl_mask)
+    if not used_v01_policy_source:
+        clip_mask = on_token_mask if mode in {0, 3} else effective_mask
+        pg_clipfrac = _masked_mean_or_zero(
+            torch.gt(on_losses_clipped, on_losses_unclipped).float(),
+            clip_mask,
+        )
+        ppo_kl_mask = on_token_mask if mode in {0, 3} else effective_mask
+        ppo_kl = _masked_mean_or_zero(-log_ratio, ppo_kl_mask)
     metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),

@@ -51,8 +51,10 @@ def _compute_batch_metrics(
     solve_none = 0
     solve_none_format = 0
     solve_all = 0
+    success_counts = []
     for uid in np.unique(uids):
         group_scores = scores[np.flatnonzero(uids == uid).tolist()]
+        success_counts.append(int(_reward_matches(group_scores, success_reward).sum().item()))
         if _reward_matches(group_scores, failure_reward).all():
             solve_none += 1
         elif _reward_matches(group_scores, success_reward).all():
@@ -60,13 +62,25 @@ def _compute_batch_metrics(
         elif _reward_matches(group_scores, format_reward).all():
             solve_none_format += 1
 
-    return {
+    metrics = {
         "batch/solve_none": float(solve_none),
         "batch/solve_none_format": float(solve_none_format),
         "batch/solve_all": float(solve_all),
         "batch/solved": _reward_matches(scores, success_reward).float().mean().item(),
         "batch/failed": _reward_matches(scores, failure_reward).float().mean().item(),
     }
+    # HPT routes on the group-level best-of-n result, not only on the marginal
+    # response reward. Preserve the original scalar names above and expose the
+    # complete success-count histogram so a rollout-runtime change that alters
+    # within-prompt joint sampling cannot hide behind a similar mean reward.
+    if success_counts:
+        rollout_n = max(int((uids == uid).sum()) for uid in np.unique(uids))
+        for successes in range(rollout_n + 1):
+            metrics[f"batch/success_count_{successes}"] = float(success_counts.count(successes))
+        success_count_tensor = torch.tensor(success_counts, dtype=torch.float32)
+        metrics["batch/success_count_mean"] = float(success_count_tensor.mean().item())
+        metrics["batch/success_count_std"] = float(success_count_tensor.std(unbiased=False).item())
+    return metrics
 
 
 def _compute_on_off_metrics(
@@ -86,6 +100,34 @@ def _compute_on_off_metrics(
         "on_off_metrics/on_score": _masked_mean(sequence_score, on_policy_mask),
         "on_off_metrics/off_score": _masked_mean(sequence_score, off_policy_mask),
         "on_off_metrics/off_example_ratio": off_policy_mask.float().mean().item(),
+    }
+
+
+def _compute_rollout_diversity_metrics(batch: DataProto, uids: np.ndarray) -> dict[str, float]:
+    """Measure whether the ``n`` responses of a prompt are actually distinct.
+
+    HPT's switch decision depends on best-of-n exploration, so a rollout path
+    that accidentally correlates or duplicates per-prompt requests can look
+    superficially valid while producing many more all-failed groups.
+    """
+    responses = batch.batch["responses"]
+    response_mask = batch.batch["response_mask"]
+    unique_counts = []
+    for uid in np.unique(uids):
+        signatures = set()
+        for row in np.flatnonzero(uids == uid).tolist():
+            length = int(response_mask[row].sum().item())
+            token_ids = responses[row, :length].detach().cpu().tolist()
+            signatures.add(tuple(token_ids))
+        unique_counts.append(len(signatures))
+
+    rollout_n = max((int((uids == uid).sum()) for uid in np.unique(uids)), default=0)
+    total_responses = len(uids)
+    total_unique = sum(unique_counts)
+    return {
+        "batch/unique_responses_per_group": float(np.mean(unique_counts)) if unique_counts else 0.0,
+        "batch/unique_response_ratio": float(total_unique / total_responses) if total_responses else 0.0,
+        "batch/duplicate_response_groups": float(sum(count < rollout_n for count in unique_counts)),
     }
 
 
@@ -184,6 +226,7 @@ def apply_hpt(
         failure_reward=failure_reward,
         format_reward=format_reward,
     )
+    metrics.update(_compute_rollout_diversity_metrics(batch, uids))
 
     solved_groups = 0
     sft_groups = 0
@@ -237,8 +280,11 @@ def apply_hpt(
         selected_rewards[row].zero_()
         selected_rewards[row, valid_response_length - 1] = target_reward
 
-    # Demonstrations do not have rollout-policy log probabilities.  verl will
-    # recompute old_log_probs for the complete transformed batch below.
+    # Keep a diagnostic-only copy for the on-policy rows before removing the
+    # public field. Demonstrations do not have rollout-policy log probabilities,
+    # and verl recomputes old_log_probs for the complete transformed batch.
+    if "rollout_log_probs" in selected.batch:
+        selected.batch["hpt_rollout_log_probs"] = selected.batch["rollout_log_probs"].clone()
     for key in ("rollout_log_probs", "old_log_probs", "entropys"):
         if key in selected.batch:
             selected.batch.pop(key)

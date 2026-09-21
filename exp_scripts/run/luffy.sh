@@ -13,13 +13,12 @@ export PYTHONPATH=$ROOT/hpt:$ROOT/hpt/verl:${PYTHONPATH:-}
 # export no_proxy="127.0.0.1,localhost"
 # export NO_PROXY="127.0.0.1,localhost"
 
-# vLLM 0.9 defaults used by the migrated verl 0.9 trainer
-export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}
+# vLLM 0.24 no longer reads the old VLLM_ATTENTION_BACKEND variable.  Keep its
+# automatic backend selection: forcing FLASHINFER failed the actor-logprob audit.
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export TOKENIZERS_PARALLELISM=false
 export HYDRA_FULL_ERROR=1
 export WANDB_MODE=${WANDB_MODE:-online}
-export VLLM_USE_V1=1
 
 source /home/liting/miniconda3/etc/profile.d/conda.sh
 conda activate verl090
@@ -33,6 +32,7 @@ OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-off_policy}
 SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
 OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
+HPT_CALCULATE_LOG_PROBS=${HPT_CALCULATE_LOG_PROBS:-false}
 
 LR=${LR:-1e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B} # rope_theta=40000 and max_position_embeddings=16384
@@ -68,6 +68,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.clip_grad=1.0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
     actor_rollout_ref.actor.policy_loss.loss_mode=hpt \
@@ -86,10 +87,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.seed=0 \
-    actor_rollout_ref.rollout.max_num_seqs=1024 \
+    actor_rollout_ref.rollout.calculate_log_probs=$HPT_CALCULATE_LOG_PROBS \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.max_model_len=5120 \
+    actor_rollout_ref.rollout.max_num_seqs=1024 \
     actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.agent.num_workers=8 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
@@ -108,6 +111,7 @@ python3 -m verl.trainer.main_ppo \
     +hpt.sft_loss_coef=$SFT_LOSS_COEF \
     +hpt.off_policy_beta=$OFF_POLICY_BETA \
     +hpt.max_grad_norm=$MAX_GRAD_NORM \
+    +hpt.preserve_v01_rollout_scheduling=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name="$WANDB_PROJECT" \
     trainer.experiment_name="$EXP_NAME" \

@@ -1231,10 +1231,24 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        # Attach per-sample priority to the batch (like ``uid``) so each sample gets
-        # a globally-unique priority that flows to vLLM request scheduling. Assigned
-        # before chunking so chunks own disjoint ranges without per-worker offsets.
-        if "priority" not in prompts.non_tensor_batch:
+        hpt_config = self.config.get("hpt", None)
+        preserve_hpt_rollout_scheduling = bool(
+            hpt_config is not None
+            and hpt_config.get("enabled", False)
+            and hpt_config.get("preserve_v01_rollout_scheduling", False)
+        )
+        if preserve_hpt_rollout_scheduling:
+            # The 0.7 HPT agent loop did not attach a priority, so every request
+            # used vLLM's default priority zero.  Stock 0.9's increasing
+            # per-row priority changes request batching/RNG consumption and,
+            # therefore, the joint distribution of each prompt's n responses.
+            # HPT routes on that joint distribution (solve-none vs solved), so
+            # preserve the old equal-priority contract explicitly.
+            from verl.mix_src.legacy_rollout import legacy_equal_request_priorities
+
+            prompts.non_tensor_batch["priority"] = legacy_equal_request_priorities(len(prompts))
+        elif "priority" not in prompts.non_tensor_batch:
+            # Keep stock verl 0.9 behavior outside the HPT compatibility path.
             prompts.non_tensor_batch["priority"] = np.arange(len(prompts), dtype=np.int64)
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))

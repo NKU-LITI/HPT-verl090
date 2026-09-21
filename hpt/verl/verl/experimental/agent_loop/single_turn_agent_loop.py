@@ -62,12 +62,19 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         metrics = {}
+        # Keep the canonical HPT/verl-0.7 single-turn request contract.  The
+        # server has its own context-dependent default, but the reference path
+        # always asked vLLM for exactly response_length new tokens and let EOS
+        # terminate generation.  Passing it explicitly also prevents a future
+        # server-default change from silently altering HPT's rollout horizon.
+        request_sampling_params = dict(sampling_params)
+        request_sampling_params["max_tokens"] = self.response_length
         with simple_timer("generate_sequences", metrics):
             request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
             output: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
+                sampling_params=request_sampling_params,
                 image_data=images,
                 audio_data=audios,
                 video_data=videos,

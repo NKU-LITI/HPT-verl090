@@ -8,6 +8,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,11 +19,13 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from verl import DataProto
 from verl.experimental.hpt.actor_update import (
+    legacy_constant_schedule_scale,
     legacy_grad_norm_skip,
     legacy_gradient_accumulation,
+    normalize_actor_batch_sizes,
     scale_legacy_backward_loss,
 )
-from verl.experimental.hpt.algorithm import _compute_batch_metrics, apply_hpt
+from verl.experimental.hpt.algorithm import _compute_batch_metrics, _compute_rollout_diversity_metrics, apply_hpt
 from verl.experimental.hpt.dataset import (
     HPTLegacyRandomSampler,
     _strip_duplicate_think_prefix,
@@ -35,18 +38,21 @@ from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_
 from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
 from verl.experimental.hpt.reward import legacy_reward_input
 from verl.experimental.hpt.reward_manager import decode_legacy_response
+from verl.mix_src.legacy_rollout import legacy_equal_request_priorities
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _attach_hpt_reward,
     _global_ppo_mini_batch_size,
     _hpt_legacy_gradient_accumulation,
+    _hpt_rollout_actor_logprob_metrics,
+    _hpt_rollout_weight_version_metrics,
 )
 from verl.utils import tensordict_utils as tu
 from verl.utils.metric import AggregationType
 from verl.utils.seqlen_balancing import rearrange_micro_batches_hpt_legacy
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 from verl.workers.engine.utils import prepare_micro_batches
-from verl.workers.engine_workers import _select_valid_rows
+from verl.workers.engine_workers import TrainingWorker, _select_valid_rows
 from verl.workers.utils.losses import ppo_loss
 
 
@@ -222,6 +228,50 @@ def test_hpt_sampler_resume_at_epoch_boundary_starts_next_permutation():
 def test_hpt_sampler_factory_keeps_non_shuffled_order():
     sampler = create_hpt_train_sampler(OmegaConf.create({"shuffle": False, "seed": 47}), range(8))
     assert list(sampler) == list(range(8))
+
+
+def test_hpt_gpu_launchers_pin_reference_actor_batch_sizes_and_optional_logprob_audit():
+    repository_root = Path(__file__).resolve().parents[5]
+    required_overrides = (
+        "actor_rollout_ref.actor.ppo_micro_batch_size=1",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4",
+        "actor_rollout_ref.rollout.max_num_seqs=1024",
+        "actor_rollout_ref.rollout.agent.num_workers=8",
+        "+hpt.preserve_v01_rollout_scheduling=True",
+        "actor_rollout_ref.rollout.calculate_log_probs=$HPT_CALCULATE_LOG_PROBS",
+    )
+    for name in ("hpt.sh", "hpt_dft.sh", "luffy.sh", "srft.sh"):
+        launcher = (repository_root / "exp_scripts" / "run" / name).read_text()
+        for override in required_overrides:
+            assert override in launcher, f"{name} is missing legacy-compat override: {override}"
+        assert "actor_rollout_ref.actor.optim.lr_warmup_steps=1" in launcher
+        assert "export VLLM_ATTENTION_BACKEND=" not in launcher
+        assert "engine_kwargs.vllm.attention_backend=" not in launcher
+
+
+def test_hpt_one_warmup_step_reproduces_reference_zero_warmup_lr_sequence():
+    from verl.utils.torch_functional import get_constant_schedule_with_warmup
+
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=5e-6)
+    scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps=1)
+
+    # verl 0.1's zero-warmup lambda was step / max(1, warmup), so its
+    # initialization was also zero and its first scheduler step restored 5e-6.
+    assert legacy_constant_schedule_scale(0, num_warmup_steps=0) == 0.0
+    assert legacy_constant_schedule_scale(1, num_warmup_steps=0) == 1.0
+    assert optimizer.param_groups[0]["lr"] == 0.0
+    optimizer.step()
+    scheduler.step()
+    assert optimizer.param_groups[0]["lr"] == 5e-6
+
+
+def test_hpt_legacy_rollout_uses_equal_request_priorities():
+    priorities = legacy_equal_request_priorities(512)
+
+    assert priorities.dtype == np.int64
+    assert priorities.shape == (512,)
+    assert priorities.tolist() == [0] * 512
 
 
 def test_hpt_trainer_replaces_preconstructed_verl090_sampler():
@@ -499,6 +549,49 @@ def _batch():
     )
 
 
+def test_hpt_rollout_diversity_metrics_detect_best_of_n_collapse():
+    batch = _batch()
+    metrics = _compute_rollout_diversity_metrics(batch, batch.non_tensor_batch["uid"])
+    assert metrics == {
+        "batch/unique_responses_per_group": 2.0,
+        "batch/unique_response_ratio": 1.0,
+        "batch/duplicate_response_groups": 0.0,
+    }
+
+    batch.batch["responses"][1] = batch.batch["responses"][0]
+    collapsed = _compute_rollout_diversity_metrics(batch, batch.non_tensor_batch["uid"])
+    assert collapsed == {
+        "batch/unique_responses_per_group": 1.5,
+        "batch/unique_response_ratio": 0.75,
+        "batch/duplicate_response_groups": 1.0,
+    }
+
+
+def test_hpt_rollout_weight_version_metrics_detect_stale_server():
+    batch = _batch()
+    batch.non_tensor_batch["global_steps"] = np.array([2, 2, 2, 1])
+    metrics = _hpt_rollout_weight_version_metrics(batch, trainer_step=3)
+    assert metrics["hpt/rollout_weight_version_available"] == 1.0
+    assert metrics["hpt/rollout_weight_version_min"] == 1.0
+    assert metrics["hpt/rollout_weight_version_max"] == 2.0
+    assert metrics["hpt/rollout_weight_version_expected"] == 2.0
+    assert metrics["hpt/rollout_weight_version_mismatch_ratio"] == 0.25
+
+
+def test_hpt_rollout_actor_logprob_metrics_exclude_sft_rows():
+    batch = _batch().select_idxs([0, 1])
+    batch.batch["hpt_sft_mask"] = torch.tensor([False, True])
+    batch.batch["hpt_rollout_log_probs"] = torch.tensor([[-0.2, -0.4, 0.0], [9.0, 9.0, 9.0]])
+    batch.batch["old_log_probs"] = torch.tensor([[-0.1, -0.6, 0.0], [0.0, 0.0, 0.0]])
+
+    metrics = _hpt_rollout_actor_logprob_metrics(batch)
+    assert metrics["hpt/rollout_actor_logprob_available"] == 1.0
+    assert np.isclose(metrics["hpt/rollout_actor_logprob_abs_mean"], 0.15)
+    assert np.isclose(metrics["hpt/rollout_actor_logprob_abs_max"], 0.2)
+    assert np.isclose(metrics["hpt/rollout_actor_logprob_signed_mean"], -0.05)
+    assert metrics["hpt/rollout_actor_logprob_nonfinite_ratio"] == 0.0
+
+
 def test_target_normalization():
     assert _target_to_text("answer") == "answer"
     assert _target_to_text({"role": "assistant", "content": "answer"}) == "answer"
@@ -556,9 +649,10 @@ def test_post_hpt_reward_stays_aligned_through_balance():
 
 
 def test_hpt_ppo_mini_batch_target_matches_reference():
-    # Reference worker normalization: configured 32 prompts * rollout.n 8,
-    # then DP dispatch turns the fixed global 256 into 128 rows per rank.
+    # The 0.1 worker mutates configured 32 by rollout.n=8 and DP=2 before the
+    # actor sees it: global 256, local 128.  The 0.9 engine accepts global 256.
     assert _global_ppo_mini_batch_size(configured_size=32, rollout_n=8) == 256
+    assert normalize_actor_batch_sizes(32, 1, rollout_n=8, world_size=2) == (128, 4)
 
 
 def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
@@ -609,6 +703,7 @@ def test_update_actor_keeps_hpt_mini_batch_target_independent_of_routed_rows():
             )
 
     trainer.actor_rollout_wg = _ActorWorkerGroup()
+    trainer.actor_rollout_wg._dispatch_info = {"actor": [0, 1]}
     for routed_rows in (2, 4):
         batch = _batch().select_idxs(list(range(routed_rows)))
         batch.batch["hpt_valid_mask"] = torch.ones(routed_rows, dtype=torch.bool)
@@ -776,6 +871,59 @@ def test_hpt_padding_is_removed_before_partial_mini_batch_split():
     assert torch.equal(mini_batches[1]["row_id"], torch.arange(128, 130))
 
 
+def test_hpt_real_batch_runs_two_local_optimizer_minibatches_and_schedules_once():
+    """Exercise the 64-prompt run shape that the earlier batch-8 smoke test missed."""
+
+    class _Engine:
+        def __init__(self):
+            self.train_mode_args = []
+
+        def get_data_parallel_size(self):
+            return 2
+
+        def get_data_parallel_rank(self):
+            return 0
+
+        def is_mp_src_rank_with_outputs(self):
+            return False
+
+        @contextmanager
+        def train_mode(self, **kwargs):
+            self.train_mode_args.append(kwargs)
+            yield
+
+    worker = SimpleNamespace(engine=_Engine(), profiler=SimpleNamespace(step=lambda: None))
+    calls = []
+
+    def train_batch(mini_batch):
+        calls.append(
+            (
+                len(mini_batch),
+                bool(tu.get(mini_batch, "update_lr_scheduler")),
+                tu.get(mini_batch, "hpt_legacy_gradient_accumulation"),
+            )
+        )
+        return TensorDict({}, batch_size=[])
+
+    worker.train_batch = train_batch
+    data = TensorDict({"row_id": torch.arange(220)}, batch_size=[220])
+    tu.assign_non_tensor(
+        data,
+        mini_batch_size=256,
+        epochs=1,
+        seed=42,
+        dataloader_kwargs={"shuffle": False},
+        allow_partial_mini_batch=True,
+        hpt_legacy_gradient_accumulation=32,
+    )
+
+    output = TrainingWorker.train_mini_batch(worker, data)
+
+    assert output is None
+    assert calls == [(128, False, 32), (92, True, 32)]
+    assert worker.engine.train_mode_args == [{"disable_auto_offload": False, "zero_grad_on_exit": False}]
+
+
 def test_hpt_padding_selection_supports_async_rollout_nested_tensors():
     nested = torch.nested.as_nested_tensor(
         [torch.tensor([10, 11]), torch.tensor([20]), torch.tensor([30, 31, 32])],
@@ -906,13 +1054,19 @@ def test_hpt_batch_metrics_classify_uniform_reward_groups():
         format_reward=-1.0,
     )
 
+    success_count_std = metrics.pop("batch/success_count_std")
     assert metrics == {
         "batch/solve_none": 1.0,
         "batch/solve_none_format": 1.0,
         "batch/solve_all": 1.0,
         "batch/solved": 3 / 8,
         "batch/failed": 3 / 8,
+        "batch/success_count_0": 2.0,
+        "batch/success_count_1": 1.0,
+        "batch/success_count_2": 1.0,
+        "batch/success_count_mean": 0.75,
     }
+    assert np.isclose(success_count_std, 0.8291562)
 
 
 def test_hpt_final_padding_and_balance_match_legacy_layout():

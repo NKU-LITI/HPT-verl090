@@ -144,8 +144,61 @@ def _attach_hpt_reward(batch: DataProto, reward_tensor: torch.Tensor) -> None:
     batch.batch["token_level_scores"] = reward_tensor
 
 
+def _hpt_rollout_weight_version_metrics(batch: DataProto, trainer_step: int) -> dict[str, float]:
+    """Report which actor-weight version produced the current rollout.
+
+    The async vLLM server attaches its last synchronized ``global_steps`` value
+    to every response.  At trainer step ``s`` the expected rollout version is
+    ``s - 1`` (version 0 is installed before the first training batch).
+    """
+    versions = batch.non_tensor_batch.get("global_steps")
+    if versions is None:
+        return {"hpt/rollout_weight_version_available": 0.0}
+    try:
+        version_array = np.asarray(versions, dtype=np.int64).reshape(-1)
+    except (TypeError, ValueError):
+        return {"hpt/rollout_weight_version_available": 0.0}
+    if version_array.size == 0:
+        return {"hpt/rollout_weight_version_available": 0.0}
+    expected = max(int(trainer_step) - 1, 0)
+    return {
+        "hpt/rollout_weight_version_available": 1.0,
+        "hpt/rollout_weight_version_min": float(version_array.min()),
+        "hpt/rollout_weight_version_max": float(version_array.max()),
+        "hpt/rollout_weight_version_expected": float(expected),
+        "hpt/rollout_weight_version_mismatch_ratio": float(np.mean(version_array != expected)),
+    }
+
+
+def _hpt_rollout_actor_logprob_metrics(batch: DataProto) -> dict[str, float]:
+    """Compare vLLM token log-probs with the pre-update actor forward pass."""
+    if "hpt_rollout_log_probs" not in batch.batch:
+        return {"hpt/rollout_actor_logprob_available": 0.0}
+    on_policy_rows = ~batch.batch["hpt_sft_mask"].bool()
+    mask = batch.batch["response_mask"].bool() & on_policy_rows.unsqueeze(-1)
+    rollout_log_prob = batch.batch["hpt_rollout_log_probs"].float()
+    actor_log_prob = batch.batch["old_log_probs"].float()
+    finite = torch.isfinite(rollout_log_prob) & torch.isfinite(actor_log_prob)
+    valid = mask & finite
+    if not valid.any():
+        return {
+            "hpt/rollout_actor_logprob_available": 0.0,
+            "hpt/rollout_actor_logprob_nonfinite_ratio": 1.0,
+        }
+    delta = (actor_log_prob - rollout_log_prob)[valid]
+    masked_count = int(mask.sum().item())
+    return {
+        "hpt/rollout_actor_logprob_available": 1.0,
+        "hpt/rollout_actor_logprob_abs_mean": float(delta.abs().mean().item()),
+        "hpt/rollout_actor_logprob_abs_max": float(delta.abs().max().item()),
+        "hpt/rollout_actor_logprob_abs_p99": float(torch.quantile(delta.abs(), 0.99).item()),
+        "hpt/rollout_actor_logprob_signed_mean": float(delta.mean().item()),
+        "hpt/rollout_actor_logprob_nonfinite_ratio": float(1.0 - valid.sum().item() / masked_count),
+    }
+
+
 def _global_ppo_mini_batch_size(configured_size: int, rollout_n: int) -> int:
-    """Match the legacy worker's prompt-to-sequence mini-batch conversion."""
+    """Return the stock verl global mini-batch size."""
     global_size = configured_size * rollout_n
     if global_size <= 0:
         raise ValueError(f"global PPO mini-batch size must be positive, got {global_size}")
@@ -1592,6 +1645,11 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    hpt_config = self.config.get("hpt", None)
+                    hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
+                    if hpt_enabled:
+                        metrics.update(_hpt_rollout_weight_version_metrics(batch, self.global_steps))
+
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     from verl.utils.hpt_debug_dump import dump_boundary as _hpt_dump_boundary
@@ -1603,8 +1661,6 @@ class RayPPOTrainer:
                         step=self.global_steps,
                         dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
                     )
-                    hpt_config = self.config.get("hpt", None)
-                    hpt_enabled = hpt_config is not None and hpt_config.get("enabled", False)
                     hpt_inference_pad_size = 0
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1737,6 +1793,8 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            if hpt_enabled:
+                                metrics.update(_hpt_rollout_actor_logprob_metrics(batch))
                             _hpt_dump_boundary(
                                 "verl090",
                                 "old_log_probs_complete",
