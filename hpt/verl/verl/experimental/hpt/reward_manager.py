@@ -9,8 +9,11 @@
 """Reward-manager compatibility for canonical verl 0.1 HPT."""
 
 import inspect
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 
 from verl import DataProto
+from verl.experimental.hpt.reward import compute_score_in_process
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
 
@@ -29,6 +32,12 @@ class LegacyHPTRewardManager(RewardManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
+        # verl 0.1 scored serially in the process main thread. verl 0.9's
+        # reward loop sends synchronous functions to a ThreadPoolExecutor,
+        # where entropy_math's SIGALRM guards either fail closed or must be
+        # disabled (which can hang indefinitely in SymPy). A persistent spawned
+        # worker restores both the legacy score and its hard timeout semantics.
+        self._legacy_score_executor = ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn"))
 
     async def run_single(self, data: DataProto) -> dict:
         data_item = data[-1:][0]
@@ -67,14 +76,11 @@ class LegacyHPTRewardManager(RewardManagerBase):
             )
         else:
             result = await self.loop.run_in_executor(
-                None,
-                lambda: self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                    **extra_reward_kwargs,
-                ),
+                self._legacy_score_executor,
+                compute_score_in_process,
+                data_source,
+                response_str,
+                ground_truth,
             )
 
         if isinstance(result, dict):

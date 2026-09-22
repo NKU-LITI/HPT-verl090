@@ -21,7 +21,6 @@ Based on HF math_verify, verl, open reasoner zero, etc.
 import os
 import re
 import signal
-import threading
 from itertools import islice, zip_longest
 from math import isclose
 from typing import Optional
@@ -49,12 +48,6 @@ def timeout_ours(timeout_seconds: int = 8):
                 raise TimeoutError("Operation timed out!")
 
             def wrapper(*args, **kwargs):
-                # The 0.9 reward loop deliberately executes synchronous reward
-                # functions in a thread pool.  SIGALRM can only be installed by
-                # Python's main thread; keep the grading operation identical and
-                # degrade only the timeout guard when called from that pool.
-                if threading.current_thread() is not threading.main_thread():
-                    return func(*args, **kwargs)
                 old_handler = signal.getsignal(signal.SIGALRM)
                 signal.signal(signal.SIGALRM, handler)
                 signal.alarm(timeout_seconds)
@@ -535,16 +528,11 @@ class timeout:
         raise TimeoutError(self.error_message)
 
     def __enter__(self):
-        self._enabled = threading.current_thread() is threading.main_thread()
-        if not self._enabled:
-            return self
         signal.signal(signal.SIGALRM, self.handle_timeout)
         signal.alarm(self.seconds)
-        return self
 
     def __exit__(self, type, value, traceback):
-        if self._enabled:
-            signal.alarm(0)
+        signal.alarm(0)
 
 
 def latex_eval(latex):

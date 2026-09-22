@@ -22,3 +22,8 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     """Run the exact entropy_math verifier selected by canonical HPT."""
     del data_source, extra_info, kwargs
     return float(bool(legacy_entropy_math_score(legacy_reward_input(solution_str), ground_truth)))
+
+
+def compute_score_in_process(data_source, solution_str, ground_truth) -> float:
+    """Pickle-stable entry point used by the legacy reward process pool."""
+    return compute_score(data_source, solution_str, ground_truth)

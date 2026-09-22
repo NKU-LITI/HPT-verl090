@@ -617,6 +617,33 @@ def test_hpt_reward_is_compatible_with_async_reward_loop_thread_pool():
     assert result == 1.0
 
 
+def test_hpt_reward_math_verify_fallback_matches_legacy_in_process_pool():
+    # The strict mathd/sympy paths reject these equivalent forms, so this
+    # exercises entropy_math's math_verify fallback. math_verify's positive
+    # timeout uses SIGALRM and otherwise fails closed in reward-loop threads.
+    cases = [
+        (r"reasoning \boxed{524288}<eos>", r"2^{19}"),
+        (r"reasoning \boxed{3x+5y+3z=-10}<eos>", r"3x+5y+3z+10=0"),
+    ]
+    expected = [compute_hpt_reward("math", solution, ground_truth) for solution, ground_truth in cases]
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+
+    from verl.experimental.hpt.reward import compute_score_in_process
+
+    with ProcessPoolExecutor(max_workers=1, mp_context=mp.get_context("spawn")) as executor:
+        actual = list(
+            executor.map(
+                compute_score_in_process,
+                ["math"] * len(cases),
+                [case[0] for case in cases],
+                [case[1] for case in cases],
+            )
+        )
+    assert expected == [1.0, 1.0]
+    assert actual == expected
+
+
 def test_gen_batch_keeps_target_on_driver_batch():
     data = DataProto(
         batch=TensorDict({"dummy": torch.ones(1, 1)}, batch_size=[1]),

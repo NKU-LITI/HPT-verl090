@@ -11,7 +11,7 @@ inside the 0.9 tree.  The files are executable, not dead reference copies.
 | `utils/torch_functional.py::get_constant_schedule_with_warmup` | `legacy_actor_update.py::legacy_constant_schedule_scale` | launchers use one explicit 0.9 warmup step |
 | verl-0.7 `experimental/agent_loop/agent_loop.py` (8 workers, no request priority) | `legacy_rollout.py` | `experimental/agent_loop/agent_loop.py` |
 | `mix_src/rl_dataset_with_target.py::ResumableRandomSampler` | `legacy_sampler.py` | `experimental/hpt/dataset.py` |
-| `mix_src/entropy_math/` | unchanged algorithm body in `experimental/hpt/legacy_entropy_math.py` | `experimental/hpt/reward.py` |
+| `mix_src/entropy_math/` | unchanged algorithm body in `experimental/hpt/legacy_entropy_math.py` | `experimental/hpt/reward.py`, process-main-thread boundary in `experimental/hpt/reward_manager.py` |
 
 The full old trainer/worker/rollout files are not imported into 0.9 because
 their Ray, DataProto, FSDP, and vLLM interfaces no longer exist.  The boundary
