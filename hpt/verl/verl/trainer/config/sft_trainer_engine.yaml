@@ -24,6 +24,10 @@ data:
   val_max_samples: -1  # set to -1 to use full dataset
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
+  # Optional prompt column used when messages_key is absent
+  prompt_key: null
+  # Optional target column used when messages_key is absent
+  target_key: null
   tools_key: tools  # Key for tools list in multi-turn mode
   enable_thinking_key: enable_thinking  # Whether to enable thinking in multi-turn mode
   enable_thinking_default: none         # The default value when enable_thinking_key is not present in the dataset

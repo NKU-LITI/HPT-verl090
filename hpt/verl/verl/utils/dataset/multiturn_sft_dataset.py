@@ -42,6 +42,39 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _normalize_message_column(value: Any, default_role: str, column_name: str) -> list[dict[str, Any]]:
+    """Normalize a prompt/target cell into chat-template message dictionaries."""
+    value = convert_nested_value_to_list_recursive(value)
+    if value is None:
+        return []
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, list):
+        raise TypeError(f"Column '{column_name}' must contain a string, message dict, or message list")
+
+    messages = []
+    for message in value:
+        if isinstance(message, str):
+            message = {"role": default_role, "content": message}
+        elif isinstance(message, dict):
+            message = dict(message)
+            message.setdefault("role", default_role)
+        else:
+            raise TypeError(f"Column '{column_name}' contains an unsupported message type: {type(message)!r}")
+        if "content" not in message:
+            raise ValueError(f"Column '{column_name}' contains a message without a 'content' field")
+        messages.append(message)
+    return messages
+
+
+def _merge_prompt_target_messages(prompt: Any, target: Any, prompt_key: str, target_key: str) -> list[dict[str, Any]]:
+    messages = _normalize_message_column(prompt, default_role="user", column_name=prompt_key)
+    messages.extend(_normalize_message_column(target, default_role="assistant", column_name=target_key))
+    if not messages:
+        raise ValueError(f"Both '{prompt_key}' and '{target_key}' are empty")
+    return messages
+
+
 def once(func):
     """Decorator to ensure a function runs only once. Subsequent calls do nothing."""
 
@@ -101,6 +134,10 @@ class MultiTurnSFTDataset(Dataset):
         self.max_length = config.get("max_length", 1024)
         # Get messages_key from the new multiturn config structure
         self.messages_key = config.get("messages_key", "messages")
+        # Optional compatibility path for RL-style parquet files. When the
+        # messages column is absent, prompt and target are joined as one chat.
+        self.prompt_key = config.get("prompt_key", None)
+        self.target_key = config.get("target_key", None)
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get(
@@ -147,6 +184,20 @@ class MultiTurnSFTDataset(Dataset):
             dataframe = pd.read_parquet(parquet_file, dtype_backend="pyarrow")
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
+
+        if self.messages_key not in self.dataframe.columns:
+            if not self.prompt_key or not self.target_key:
+                raise KeyError(
+                    f"Dataset has no '{self.messages_key}' column. Set data.prompt_key and data.target_key "
+                    "to train directly from separate prompt/target columns."
+                )
+            missing_columns = {self.prompt_key, self.target_key} - set(self.dataframe.columns)
+            if missing_columns:
+                raise KeyError(f"Dataset is missing configured SFT columns: {sorted(missing_columns)}")
+            self.dataframe[self.messages_key] = [
+                _merge_prompt_target_messages(prompt, target, self.prompt_key, self.target_key)
+                for prompt, target in zip(self.dataframe[self.prompt_key], self.dataframe[self.target_key], strict=True)
+            ]
 
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")

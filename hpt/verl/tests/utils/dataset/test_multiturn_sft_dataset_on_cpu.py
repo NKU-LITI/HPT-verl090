@@ -30,10 +30,24 @@ from transformers.utils import get_json_schema
 
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.dataset.dataset_utils import DatasetPadMode, SFTTensorCollator
-from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
+from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset, _merge_prompt_target_messages
 from verl.utils.model import extract_multi_modal_inputs
 
 custom_model_prefix = Path("~/models").expanduser().resolve()
+
+
+def test_merge_prompt_target_messages():
+    prompt = [
+        {"role": "system", "content": "Be concise."},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+    target = [{"role": "assistant", "content": "4"}]
+
+    assert _merge_prompt_target_messages(prompt, target, "prompt", "target") == prompt + target
+    assert _merge_prompt_target_messages("Question", "Answer", "prompt", "target") == [
+        {"role": "user", "content": "Question"},
+        {"role": "assistant", "content": "Answer"},
+    ]
 
 
 @pytest.mark.parametrize(
