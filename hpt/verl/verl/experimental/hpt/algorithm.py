@@ -193,10 +193,16 @@ def apply_hpt(
     ``strategy=mix`` keeps all on-policy rollouts and replaces the first one in
     each group with a supervised trajectory.  It is provided for reproducing
     the repository's SFT+RL/LUFFY-style ablations.
+
+    ``strategy=luffy_passk0`` keeps every on-policy rollout.  For a prompt
+    whose pass@k is zero it additionally appends one offline target with the
+    same UID.  The failed online trajectories and successful target therefore
+    share one GRPO group, while prompts with pass@k > 0 remain pure GRPO.
     """
     strategy = _get(config, "strategy", "switch")
-    if strategy not in {"switch", "mix"}:
-        raise ValueError(f"Unsupported HPT strategy {strategy!r}; expected 'switch' or 'mix'")
+    supported_strategies = {"switch", "mix", "luffy_passk0"}
+    if strategy not in supported_strategies:
+        raise ValueError(f"Unsupported HPT strategy {strategy!r}; expected one of {sorted(supported_strategies)}")
     if "hpt_target" not in batch.non_tensor_batch:
         raise KeyError("HPT requires data.custom_cls=HPTDataset so that 'hpt_target' is available")
     if "uid" not in batch.non_tensor_batch:
@@ -211,9 +217,10 @@ def apply_hpt(
     offline_modes = {"sft": 0, "off_policy": 1, "srft": 2, "dft": 3}
     if offline_loss_type not in offline_modes:
         raise ValueError(
-            f"Unsupported HPT offline_loss_type {offline_loss_type!r}; "
-            f"expected one of {sorted(offline_modes)}"
+            f"Unsupported HPT offline_loss_type {offline_loss_type!r}; expected one of {sorted(offline_modes)}"
         )
+    if strategy == "luffy_passk0" and offline_loss_type != "off_policy":
+        raise ValueError("hpt.strategy=luffy_passk0 requires hpt.offline_loss_type=off_policy")
     off_policy_beta = float(_get(config, "off_policy_beta", 0.1))
     if off_policy_beta <= 0:
         raise ValueError("hpt.off_policy_beta must be positive")
@@ -238,7 +245,14 @@ def apply_hpt(
         uid_indices[uid] = indices
         successes = int(torch.isclose(scores[indices], scores.new_tensor(success_reward)).sum())
         solved_groups += int(successes > 0)
-        use_sft = strategy == "mix" or successes <= switch_gate
+        if strategy == "mix":
+            use_sft = True
+        elif strategy == "luffy_passk0":
+            # pass@k is binary at prompt level: any successful rollout routes
+            # to pure GRPO; only an all-failed group receives LUFFY guidance.
+            use_sft = successes == 0
+        else:
+            use_sft = successes <= switch_gate
         use_sft_by_uid[uid] = use_sft
         sft_groups += int(use_sft)
 
@@ -248,20 +262,27 @@ def apply_hpt(
         solved_rows = [row for row, uid in enumerate(uids) if not use_sft_by_uid[uid]]
         target_rows = [uid_indices[uid][0] for uid in sorted_uids if use_sft_by_uid[uid]]
         keep = solved_rows + target_rows
-        sft_source_rows = set(target_rows)
+        sft_flags = [False] * len(solved_rows) + [True] * len(target_rows)
+    elif strategy == "luffy_passk0":
+        # Retain all k online rollouts, then append exactly one target for each
+        # pass@k=0 prompt.  A source-index set cannot represent this because
+        # the target is a duplicate of an online row before replacement.
+        online_rows = list(range(len(uids)))
+        target_rows = [uid_indices[uid][0] for uid in sorted_uids if use_sft_by_uid[uid]]
+        keep = online_rows + target_rows
+        sft_flags = [False] * len(online_rows) + [True] * len(target_rows)
     else:
         # Preserve the existing noncanonical mix path; Phase 4 only changes switch.
         keep = []
-        sft_source_rows = set()
+        sft_flags = []
         for uid in dict.fromkeys(uids.tolist()):
             indices = uid_indices[uid]
             keep.extend(indices)
-            if use_sft_by_uid[uid]:
-                sft_source_rows.add(indices[0])
+            sft_flags.extend([use_sft_by_uid[uid]] + [False] * (len(indices) - 1))
 
     selected = batch.select_idxs(keep)
     selected_rewards = reward_tensor[torch.tensor(keep, device=reward_tensor.device)]
-    sft_mask = torch.tensor([source in sft_source_rows for source in keep], dtype=torch.bool)
+    sft_mask = torch.tensor(sft_flags, dtype=torch.bool)
     valid_mask = torch.ones(len(keep), dtype=torch.bool)
     prefix_mask = torch.zeros_like(selected.batch["response_mask"], dtype=torch.bool)
 
@@ -316,7 +337,10 @@ def apply_hpt(
             "hpt/sft_groups": float(sft_groups),
             "hpt/rl_groups": float(len(set(uids.tolist())) - sft_groups),
             "hpt/solved_groups": float(solved_groups),
+            "hpt/passk_positive_groups": float(solved_groups),
+            "hpt/passk_zero_groups": float(len(set(uids.tolist())) - solved_groups),
             "hpt/sft_sequences": float(sft_mask.sum().item()),
+            "hpt/online_sequences": float((~sft_mask).sum().item()),
             "hpt/valid_sequences": float(len(keep)),
             "hpt/padded_sequences": float(pad_size),
             "hpt/offline_mode": float(offline_modes[offline_loss_type]),

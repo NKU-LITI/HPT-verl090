@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 from tensordict import TensorDict
@@ -39,6 +40,7 @@ from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
 from verl.experimental.hpt.reward import legacy_reward_input
 from verl.experimental.hpt.reward_manager import decode_legacy_response
 from verl.mix_src.legacy_rollout import legacy_equal_request_priorities
+from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     _attach_hpt_reward,
@@ -1067,6 +1069,64 @@ def test_switch_matches_legacy_post_selector_order_before_padding():
     assert metrics["on_off_metrics/on_score"] == 0.5
     assert metrics["on_off_metrics/off_score"] == 1.0
     assert np.isclose(metrics["on_off_metrics/off_example_ratio"], 1 / 3)
+
+
+def test_luffy_passk0_keeps_failed_rollouts_and_appends_target():
+    reward = torch.zeros(4, 3)
+    reward[2, 1] = 1
+    output, output_reward, metrics = apply_hpt(
+        _batch(),
+        reward,
+        _Tokenizer(),
+        {"strategy": "luffy_passk0", "offline_loss_type": "off_policy"},
+        dp_size=2,
+    )
+
+    # UID a has pass@2=0: both failed online rows remain and one offline target
+    # is appended. UID b has pass@2>0 and remains a two-row pure-GRPO group.
+    assert len(output) == 5
+    assert output.non_tensor_batch["uid"].tolist() == ["a", "a", "b", "b", "a"]
+    assert output.batch["hpt_sft_mask"].tolist() == [False, False, False, False, True]
+    assert output.batch["prefix_mask"].tolist() == [
+        [False] * 3,
+        [False] * 3,
+        [False] * 3,
+        [False] * 3,
+        [True] * 3,
+    ]
+    assert output.batch["hpt_offline_mode"].tolist() == [1] * 5
+    assert output_reward.sum(dim=-1).tolist() == [0.0, 0.0, 1.0, 0.0, 1.0]
+    assert metrics["hpt/sft_groups"] == 1
+    assert metrics["hpt/rl_groups"] == 1
+    assert metrics["hpt/passk_zero_groups"] == 1
+    assert metrics["hpt/passk_positive_groups"] == 1
+    assert metrics["hpt/sft_sequences"] == 1
+    assert metrics["hpt/online_sequences"] == 4
+    assert np.isclose(metrics["on_off_metrics/off_example_ratio"], 1 / 5)
+
+    advantages, _ = compute_grpo_outcome_advantage(
+        token_level_rewards=output_reward,
+        response_mask=output.batch["response_mask"],
+        index=output.non_tensor_batch["uid"],
+        norm_adv_by_std_in_grpo=False,
+    )
+    sequence_advantages = (advantages * output.batch["response_mask"]).sum(dim=-1)
+    assert sequence_advantages[0] < 0
+    assert sequence_advantages[1] < 0
+    assert sequence_advantages[4] > 0
+    assert sequence_advantages[2] > 0
+    assert sequence_advantages[3] < 0
+
+
+def test_luffy_passk0_rejects_non_off_policy_target_loss():
+    with pytest.raises(ValueError, match="requires hpt.offline_loss_type=off_policy"):
+        apply_hpt(
+            _batch(),
+            torch.zeros(4, 3),
+            _Tokenizer(),
+            {"strategy": "luffy_passk0", "offline_loss_type": "sft"},
+            dp_size=2,
+        )
 
 
 def test_hpt_batch_metrics_classify_uniform_reward_groups():
