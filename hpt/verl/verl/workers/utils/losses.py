@@ -191,20 +191,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
             aggregation=AggregationType.MEAN,
         )
 
-    from verl.utils.hpt_debug_dump import dump_boundary as _hpt_dump_boundary
-
-    _hpt_dump_boundary(
-        "verl090",
-        "actor_loss_complete",
-        batch=data,
-        extra={
-            "loss": policy_loss.detach(),
-            "pg_loss": pg_loss.detach(),
-            "entropy": entropy_loss.detach() if entropy is not None else None,
-            "loss_metrics": pg_metrics,
-        },
-    )
-
     return policy_loss, metrics
 
 

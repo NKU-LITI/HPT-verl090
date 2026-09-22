@@ -1652,15 +1652,6 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    from verl.utils.hpt_debug_dump import dump_boundary as _hpt_dump_boundary
-
-                    _hpt_dump_boundary(
-                        "verl090",
-                        "rollout_complete",
-                        batch=batch,
-                        step=self.global_steps,
-                        dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                    )
                     hpt_inference_pad_size = 0
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1686,14 +1677,6 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "reward_complete",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                        )
 
                     if hpt_enabled:
                         if self.use_critic:
@@ -1709,14 +1692,6 @@ class RayPPOTrainer:
                         from verl.experimental.hpt.algorithm import apply_hpt
 
                         actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "hpt_switch_before",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=actor_dp_size,
-                        )
                         batch, reward_tensor, hpt_metrics = apply_hpt(
                             batch=batch,
                             reward_tensor=reward_tensor,
@@ -1725,14 +1700,6 @@ class RayPPOTrainer:
                             dp_size=actor_dp_size,
                         )
                         _attach_hpt_reward(batch, reward_tensor)
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "hpt_switch_after",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=actor_dp_size,
-                        )
                         metrics.update(hpt_metrics)
                         # Reward-side auxiliary values describe the discarded
                         # rollout batch and cannot be aligned after HPT routing.
@@ -1795,14 +1762,6 @@ class RayPPOTrainer:
                             batch = batch.union(old_log_prob)
                             if hpt_enabled:
                                 metrics.update(_hpt_rollout_actor_logprob_metrics(batch))
-                            _hpt_dump_boundary(
-                                "verl090",
-                                "old_log_probs_complete",
-                                batch=batch,
-                                reward=reward_tensor,
-                                step=self.global_steps,
-                                dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                            )
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
@@ -1872,14 +1831,6 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "advantage_complete",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                        )
 
                     if hpt_enabled:
                         from verl.experimental.hpt.layout import (
@@ -1894,14 +1845,6 @@ class RayPPOTrainer:
                         )
                         metrics["hpt/padded_sequences"] = float(final_hpt_pad_size)
                         reward_tensor = batch.batch["token_level_scores"]
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "balance_before",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                        )
                         self._balance_batch(
                             batch,
                             metrics=metrics,
@@ -1909,14 +1852,6 @@ class RayPPOTrainer:
                             hpt_legacy=True,
                         )
                         reward_tensor = batch.batch["token_level_scores"]
-                        _hpt_dump_boundary(
-                            "verl090",
-                            "balance_after",
-                            batch=batch,
-                            reward=reward_tensor,
-                            step=self.global_steps,
-                            dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                        )
                         batch.meta_info["global_token_num"] = torch.sum(
                             batch.batch["attention_mask"], dim=-1
                         ).tolist()
@@ -1934,14 +1869,6 @@ class RayPPOTrainer:
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            _hpt_dump_boundary(
-                                "verl090",
-                                "update_policy_before",
-                                batch=batch,
-                                reward=reward_tensor,
-                                step=self.global_steps,
-                                dp_size=self._get_dp_size(self.actor_rollout_wg, "actor"),
-                            )
                             actor_output = self._update_actor(batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
