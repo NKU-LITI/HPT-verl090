@@ -6,10 +6,8 @@ set -x
 #
 # 与 run_qwen3_5_grpo_910b_fsdp_reward_35b_image_test_zsg.sh 的差异：
 #   - 删除所有 GRM_* 配置和 env 透传
-#   - 删除 reward.reward_model.* 与 reward.custom_reward_function.*
-#   - reward 流走 verl/utils/reward_score/__init__.py:default_compute_score，
-#     按 parquet 里 data_source=="mm_k12_math" 分发到
-#     mm_k12_math_penalty_07311944.compute_score（见 __init__.py:93-100）
+#   - 使用 HPT legacy entropy_math reward；同步 scorer 必须通过
+#     LegacyHPTRewardManager 在独立进程主线程执行，不能回退到 naive 线程池。
 #   - trainer 占用全部 NNODES（不再为 GenRM 预留 GRM_NNODES）
 #
 # dependency: NPU vllm==0.18.0, vllm-ascend@<54879467>, transformers@<cc7ab9be>
@@ -106,9 +104,9 @@ TRAINER_NNODES=${TRAINER_NNODES:-$NNODES}
 ################## 下面是我的脚本 ##################
 export ACL_OP_EXECUTE_TIMEOUT=3600 # [ADD]
 
-ROOT=$WORK_DIR/HPT-verl090 # $WORK_DIR/verl
+# ROOT=. # $WORK_DIR/verl
 export WANDB_PROJECT=${WANDB_PROJECT:-"luffy-srft-dft"}
-export PYTHONPATH=$ROOT/hpt:$ROOT/hpt/verl:${PYTHONPATH:-}
+export PYTHONPATH=hpt:hpt/verl:${PYTHONPATH:-}
 
 UNIFY_STRATEGY="no"
 OFFLINE_LOSS_TYPE="grpo"
@@ -118,9 +116,9 @@ LR=${LR:-5e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B} # Qwen2.5-Math-7B-16k
 # MODEL_PATH=${MODEL_PATH:-"/home/ma-user/work/Scaf-GRPO/${MODEL}"} 
 MODEL_PATH=${MODEL_PATH:-"${upload_zyz}/${MODEL}"} # TODO
-EXP_BASENAME=${EXP_BASENAME:-"VERL090_NPU_${DATE}_${UNIFY_STRATEGY}-${OFFLINE_LOSS_TYPE}-${SFT_LOSS_COEF}_gate@${SWITCH_GATE}_${MODEL}_lr@${LR}_${TIME_TAG}"}
+EXP_BASENAME=${EXP_BASENAME:-"VERL090_MTP_${DATE}_GRPO_${MODEL}_lr@${LR}_${TIME_TAG}"}
 
-OUTPUT_PATH=${OUTPUT_PATH:-${zlt_data}/qwen25_math_7b}
+OUTPUT_PATH=${OUTPUT_PATH:-${zlt_data}/qwen25_math_7b/GRPO}
 EXP_NAME="${OUTPUT_PATH}/${EXP_BASENAME}" # OUTPUT_PATH
 
 
@@ -137,7 +135,7 @@ exec > >(tee -a "${EXP_NAME}/train.log") 2>&1
 
 printf '\n===== restart %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 
-DATA_DIR=${DATA_DIR:-"$ROOT/data"}
+DATA_DIR=${DATA_DIR:-"${zlt_data}/HPT_data"}
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
 TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/test.parquet","${DATA_DIR}/MATH-500/test.parquet"]}
 
@@ -205,7 +203,7 @@ if [ "${NODE_RANK}" = "0" ]; then
 
             mkdir -p ${LOG_PATH}
 
-            cd $ROOT/hpt/verl/
+            cd hpt/verl/
             
             python3 -m verl.trainer.main_ppo \
                 algorithm.adv_estimator=grpo \
@@ -256,8 +254,11 @@ if [ "${NODE_RANK}" = "0" ]; then
                 actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
                 actor_rollout_ref.ref.use_torch_compile=False \
                 actor_rollout_ref.ref.fsdp_config.param_offload=True \
-                reward.custom_reward_function.path="$ROOT/hpt/verl/verl/experimental/hpt/reward.py" \
+                reward.custom_reward_function.path="hpt/verl/verl/experimental/hpt/reward.py" \
                 reward.custom_reward_function.name=compute_score \
+                reward.reward_manager.source=importlib \
+                reward.reward_manager.name=LegacyHPTRewardManager \
+                reward.reward_manager.module.path="hpt/verl/verl/experimental/hpt/reward_manager.py" \
                 trainer.logger=['console','tensorboard'] \
                 trainer.project_name="$WANDB_PROJECT" \
                 trainer.experiment_name="$EXP_BASENAME" \

@@ -6,10 +6,8 @@ set -x
 #
 # 与 run_qwen3_5_grpo_910b_fsdp_reward_35b_image_test_zsg.sh 的差异：
 #   - 删除所有 GRM_* 配置和 env 透传
-#   - 删除 reward.reward_model.* 与 reward.custom_reward_function.*
-#   - reward 流走 verl/utils/reward_score/__init__.py:default_compute_score，
-#     按 parquet 里 data_source=="mm_k12_math" 分发到
-#     mm_k12_math_penalty_07311944.compute_score（见 __init__.py:93-100）
+#   - 使用 HPT legacy entropy_math reward；同步 scorer 必须通过
+#     LegacyHPTRewardManager 在独立进程主线程执行，不能回退到 naive 线程池。
 #   - trainer 占用全部 NNODES（不再为 GenRM 预留 GRM_NNODES）
 #
 # dependency: NPU vllm==0.18.0, vllm-ascend@<54879467>, transformers@<cc7ab9be>
@@ -258,6 +256,9 @@ if [ "${NODE_RANK}" = "0" ]; then
                 actor_rollout_ref.ref.fsdp_config.param_offload=True \
                 reward.custom_reward_function.path="$ROOT/hpt/verl/verl/experimental/hpt/reward.py" \
                 reward.custom_reward_function.name=compute_score \
+                reward.reward_manager.source=importlib \
+                reward.reward_manager.name=LegacyHPTRewardManager \
+                reward.reward_manager.module.path="$ROOT/hpt/verl/verl/experimental/hpt/reward_manager.py" \
                 trainer.logger=['console','tensorboard'] \
                 trainer.project_name="$WANDB_PROJECT" \
                 trainer.experiment_name="$EXP_BASENAME" \

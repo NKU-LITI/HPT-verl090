@@ -113,6 +113,9 @@ python3.10 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     reward.custom_reward_function.path="$ROOT/hpt/verl/verl/experimental/hpt/reward.py" \
     reward.custom_reward_function.name=compute_score \
+    reward.reward_manager.source=importlib \
+    reward.reward_manager.name=LegacyHPTRewardManager \
+    reward.reward_manager.module.path="$ROOT/hpt/verl/verl/experimental/hpt/reward_manager.py" \
     trainer.logger=['console','tensorboard'] \
     trainer.project_name="$WANDB_PROJECT" \
     trainer.experiment_name="$EXP_BASENAME" \
