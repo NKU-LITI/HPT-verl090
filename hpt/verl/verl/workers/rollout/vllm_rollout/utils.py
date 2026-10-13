@@ -286,6 +286,11 @@ class vLLMColocateWorkerExtension:
         native_reload = getattr(self.model_runner, "reload_weights", None)
         use_native_reload = (
             callable(native_reload)
+            # vLLM-Ascend keeps fused MoE weights in an NPU-specific runtime
+            # layout after initialization.  The generic layerwise reload path
+            # tries to copy checkpoint-layout tensors into that transformed
+            # storage directly, which can swap the final two dimensions.
+            and not is_npu_available
             and not self._is_qat_model
             and not self._is_modelopt_qat
             and not (peft_config and base_sync_done)

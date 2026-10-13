@@ -731,6 +731,7 @@ def test_update_weights_from_ipc_uses_native_streaming_reload(monkeypatch):
     """Native reload owns weights that may outlive the reusable IPC bucket."""
     import verl.workers.rollout.vllm_rollout.bucketed_weight_transfer as bwt
 
+    monkeypatch.setattr(_vllm_rollout_utils, "is_npu_available", False)
     receivers = []
 
     def make_receiver(*args, **kwargs):
@@ -769,3 +770,44 @@ def test_update_weights_from_ipc_uses_native_streaming_reload(monkeypatch):
     assert [name for name, _ in calls[0][0]] == ["q.weight", "k.weight"]
     assert calls[0][1] is True
     assert receivers[0].clone_for_retention is True
+
+
+def test_update_weights_from_ipc_npu_avoids_native_reload(monkeypatch):
+    """Ascend keeps using model.load_weights for NPU-specific weight layouts."""
+    import verl.workers.rollout.vllm_rollout.bucketed_weight_transfer as bwt
+
+    monkeypatch.setattr(_vllm_rollout_utils, "is_npu_available", True)
+    monkeypatch.setattr(
+        bwt,
+        "BucketedWeightReceiver",
+        lambda *a, **k: _FakeBucketReceiver(
+            [
+                ([("q.weight", torch.ones(1))], False),
+                ([("k.weight", torch.zeros(1))], True),
+            ]
+        ),
+    )
+
+    model = _FakeModel({"q.weight": torch.empty(0), "k.weight": torch.empty(0)})
+    loaded = []
+    model.load_weights = lambda weights: loaded.extend(name for name, _ in weights)
+
+    worker = _make_worker(model)
+    worker.device = torch.device("cpu")
+    worker.local_rank = 0
+    worker._is_qat_model = False
+    worker._is_modelopt_qat = False
+    worker._get_zmq_handle = lambda: "ipc:///tmp/test-bucketed-npu-reload.sock"
+
+    native_calls = []
+    worker.model_runner.reload_weights = lambda **kwargs: native_calls.append(kwargs)
+
+    # Bypass the real vLLM post-load hook; this test only verifies path selection.
+    fake_loader_utils = types.ModuleType("vllm.model_executor.model_loader.utils")
+    fake_loader_utils.process_weights_after_loading = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.model_loader.utils", fake_loader_utils)
+
+    worker.update_weights_from_ipc(peft_config=None, base_sync_done=False)
+
+    assert native_calls == []
+    assert loaded == ["q.weight", "k.weight"]
