@@ -39,17 +39,17 @@ def strip_latex_wrappers(text: str) -> str:
         if old == value: return value
 
 
-def _answers(text):
+def _answers(text, *, require_box=False):
     if text is None: raise ValueError("Missing answer")
     value = str(text).strip()
     if "</think>" in value: value = value.rsplit("</think>", 1)[1].strip()
-    elif "<think>" in value: raise ValueError("Unclosed reasoning")
     boxes, end = [], 0
     for match in re.finditer(r"\\boxed\s*\{", value):
         if match.start() < end: raise ValueError("Nested boxes")
         body, end = _group(value, match.end() - 1)
         boxes.append(body)
     if boxes: return boxes
+    if require_box: raise ValueError("Missing boxed final answer")
     lines = re.findall(r"(?im)^\s*(?:最终答案|正确答案|答案|故选|因此选|(?:final\s+|correct\s+)?answer|choice|option)\s*(?:为|是|is\b|[:：])?\s*[:：]?\s*(.*?)\s*$", value)
     return [v.rstrip("。.").strip() for v in lines] if lines else [value]
 
@@ -70,9 +70,13 @@ def extract_choice_answer(text: str, valid_choices: str = DEFAULT_CHOICES) -> st
 
 
 def verify_choice_answer(prediction: str, ground_truth: str, valid_choices: str = DEFAULT_CHOICES) -> bool:
-    pred = extract_choice_answer(prediction, valid_choices)
-    gold = extract_choice_answer(ground_truth, valid_choices)
-    return bool(gold) and pred == gold
+    try:
+        # A single choice answer is the final box; earlier boxes may be steps.
+        pred = _choice(_answers(prediction, require_box=True)[-1], valid_choices.upper())
+        gold = extract_choice_answer(ground_truth, valid_choices)
+        return bool(gold) and pred == gold
+    except ValueError:
+        return False
 
 
 UNITS = {}
@@ -139,6 +143,9 @@ def _split_prediction_fields(value, expected_count):
         lambda match: f"({ord(match.group()) - ord('①') + 1})",
         value,
     )
+    if expected_count == 1:
+        # A time such as 11:40 is one field, not an invalid "11:" label.
+        return _split(value, separators=",，;；")
 
     # A list of selected item numbers can itself be the answer, not a set of
     # empty numbered blanks: (1)(3) means the two values 1 and 3.
@@ -203,14 +210,10 @@ _LATEX_CONFIG = [LatexExtractionConfig(
 )]
 
 
-class InvalidMathValue(ValueError):
-    """A parsed mathematical value that must never be rewarded."""
-
-
 @lru_cache(maxsize=4096)
 def _math_value(value):
     """Parse one complete field with math-verify, without string fallback."""
-    value = strip_latex_wrappers(value).strip()
+    value = strip_latex_wrappers(value).strip().replace("∞", r"\infty")
     if not value or len(value) > 512:
         raise ValueError("Invalid mathematical answer length")
     if value.count("=") > 1:
@@ -223,14 +226,18 @@ def _math_value(value):
     )
     if len(parsed) != 1 or not isinstance(parsed[0], sp.Basic):
         raise ValueError("Unparsed mathematical answer")
-    result = parsed[0]
-    if isinstance(result, sp.Expr) and result.has(sp.zoo, sp.nan, sp.oo, -sp.oo):
-        raise InvalidMathValue("Nonfinite mathematical answer")
-    return result
+    return parsed[0]
 
 
 def _math_equal(gold, prediction):
     if isinstance(gold, Relational) != isinstance(prediction, Relational):
+        # A named function definition and its right-hand expression describe
+        # the same requested formula. Do not do this for x=2 versus 2.
+        from sympy.core.function import AppliedUndef
+        relation = gold if isinstance(gold, Relational) else prediction
+        expression = prediction if relation is gold else gold
+        if isinstance(relation, sp.Equality) and isinstance(relation.lhs, AppliedUndef):
+            return bool(math_verify([relation.rhs], [expression]))
         return False
     return bool(math_verify([gold], [prediction]))
 
@@ -238,6 +245,19 @@ def _math_equal(gold, prediction):
 def _looks_math(value):
     # Math-Verify interprets plain words such as abc as products of symbols.
     return bool(value == "pi" or re.search(r"[0-9\\+*/^=<>≤≥√π]", value) or re.fullmatch(r"[A-Za-z]", value))
+
+
+def _non_math_text(value):
+    # Math-Verify 0.9.0 turns 11:40 into 11/40 and 999\ldots999 into 1998.
+    # It also parses bare NaN as a product of letters, so compare it as text.
+    return bool(re.search(r"\d:\d|\\(?:ldots|cdots|dots)|\bnan\b", value, re.I))
+
+
+def _missing_squared_unit(value):
+    # OpenR1 contains ground truths whose unit name was lost, leaving this
+    # suffix. Its numeric magnitude can still be checked, but not its unit.
+    match = re.fullmatch(r"(.+?)\\mathrm\{(?:~)?\}\^\{2\}", value)
+    return match.group(1) if match else value
 
 
 def _quantity(value, expected_unit):
@@ -272,17 +292,21 @@ def _boolean(value):
 
 
 def _field_equal(prediction, ground_truth, expected_unit=None, *, allow_percent_display=True):
-    """Compare one blank, preferring exact text before mathematical equivalence."""
+    """Compare one field mathematically when safe, then use format rules."""
     pred_text = _literal(prediction)
     gold_text = _literal(ground_truth)
+    gold_text = _missing_squared_unit(gold_text)
+
+    if _looks_math(gold_text) and not (_non_math_text(pred_text) or _non_math_text(gold_text)):
+        try:
+            pred = _quantity(pred_text, expected_unit)
+            gold = _quantity(gold_text, expected_unit)
+            if pred[1] == gold[1] and _math_equal(gold[0], pred[0]):
+                return True
+        except Exception:
+            pass
+
     if pred_text == gold_text:
-        if _looks_math(gold_text):
-            try:
-                _math_value(gold_text)
-            except InvalidMathValue:
-                return False
-            except ValueError:
-                pass
         return bool(gold_text)
 
     if "\\" in pred_text and "\\" in gold_text and _latex_surface(pred_text) == _latex_surface(gold_text):
@@ -306,7 +330,7 @@ def _field_equal(prediction, ground_truth, expected_unit=None, *, allow_percent_
     if pred_text in UNITS and gold_text in UNITS:
         return UNITS[pred_text] == UNITS[gold_text]
 
-    if expected_unit is not None or _looks_math(gold_text) or gold_text in UNITS:
+    if (expected_unit is not None or _looks_math(gold_text) or gold_text in UNITS) and not (_non_math_text(pred_text) or _non_math_text(gold_text)):
         try:
             pred = _quantity(pred_text, expected_unit)
             gold = _quantity(gold_text, expected_unit)
@@ -334,7 +358,7 @@ def _percent_display_equal(prediction, ground_truth):
 
 
 def _auto_fields(text, expected_count, *, reference=False):
-    answers = _answers(text)
+    answers = _answers(text, require_box=not reference)
     if len(answers) == 1:
         if reference:
             # The canonical reference schema uses only top-level ASCII commas.
@@ -346,9 +370,9 @@ def _auto_fields(text, expected_count, *, reference=False):
     final = str(text).rsplit("</think>", 1)[-1]
     box_count = len(re.findall(r"\\boxed\s*\{", final))
     if not reference and expected_count == 1 and box_count == len(answers):
-        fields = [strip_latex_wrappers(value).strip() for value in answers]
-        if fields and all(field == fields[0] for field in fields) and len(_split_prediction_fields(fields[0], 1)) == 1:
-            return fields[:1]
+        fields = _split_prediction_fields(answers[-1], 1)
+        if len(fields) == 1:
+            return fields
     if not reference and box_count == expected_count == len(answers):
         fields = [strip_latex_wrappers(value).strip() for value in answers]
         if all(fields) and all(len(_split_prediction_fields(value, 1)) == 1 for value in fields):
@@ -418,21 +442,30 @@ def verify_answer(prediction: str, ground_truth: str, answer_type: str = "auto",
                 dimension, scale = UNITS[unit]
                 return [(scale, dimension)]
             return [_quantity(v, expected_unit) for v in _split(strip_latex_wrappers(text))]
-        pred_answers = _answers(prediction)
+        pred_answers = _answers(prediction, require_box=True)
         gold_answers = _answers(ground_truth)
-        predictions = [normalize(v) for v in pred_answers]
         references = [normalize(v) for v in gold_answers]
+        if len(references[0]) == 1:
+            pred_answers = pred_answers[-1:]
+        predictions = [normalize(v) for v in pred_answers]
         gold = references[0]
         gold_raw = _split(strip_latex_wrappers(gold_answers[0])) if answer_type == "short" else []
         def equal(items, answer):
             if len(items) != len(gold): return False
             if answer_type == "boolean": return items == gold
             raw = _split(strip_latex_wrappers(answer)) if answer_type == "short" else []
-            return all(
-                (a[1] == b[1] and _math_equal(b[0], a[0]))
-                or (answer_type == "short" and expected_unit is None and _percent_display_equal(raw[i], gold_raw[i]))
-                for i, (a, b) in enumerate(zip(items, gold))
-            )
+            def same_field(i, a, b):
+                if answer_type == "short" and (_non_math_text(raw[i]) or _non_math_text(gold_raw[i])):
+                    return _literal(raw[i]) == _literal(gold_raw[i])
+                if a[1] == b[1] and _math_equal(b[0], a[0]):
+                    return True
+                if answer_type != "short":
+                    return False
+                if (a[1] == b[1] and _literal(raw[i]) == _literal(gold_raw[i])
+                        and any(value.has(sp.zoo, sp.nan, sp.oo, -sp.oo) for value in (a[0], b[0]))):
+                    return True
+                return expected_unit is None and _percent_display_equal(raw[i], gold_raw[i])
+            return all(same_field(i, a, b) for i, (a, b) in enumerate(zip(items, gold)))
         return all(equal(items, answer) for items, answer in zip(predictions, pred_answers)) and all(
             equal(items, answer) for items, answer in zip(references, gold_answers)
         )

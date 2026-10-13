@@ -25,7 +25,7 @@ from verl.workers.config import ActorConfig, CriticConfig
 from verl.workers.utils.padding import no_padding_2_padding
 
 
-def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+def _supervised_loss(model_output, data: TensorDict, loss_type: str):
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     dp_size = data["dp_size"]
     batch_num_tokens = data["batch_num_tokens"]
@@ -42,16 +42,47 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
         # left-shift the loss mask by one token to align with log_prob
         loss_mask_flatten = torch.roll(loss_mask_flatten, shifts=-1, dims=0)
-
-        # NOTE: loss is averaged over all tokens in the batch across all data parallel groups,
-        # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
-        # the loss should be scaled by `num_microbatches` for pp schedule.
-        loss = -masked_sum(log_prob_flatten, loss_mask_flatten) / batch_num_tokens * dp_size
+        token_log_prob = log_prob_flatten
+        token_mask = loss_mask_flatten
     else:
-        response_mask = data["response_mask"].to(bool)
-        loss = -masked_sum(log_prob, response_mask) / batch_num_tokens * dp_size
+        token_log_prob = log_prob
+        token_mask = data["response_mask"].to(bool)
+
+    if loss_type == "sft":
+        token_loss = -token_log_prob
+    elif loss_type == "dft":
+        # DFT reweights each target token with the current model probability.
+        # The weight must not receive gradients; otherwise this is an entropy
+        # objective instead of the DFT probability-weighted NLL.
+        token_loss = -torch.exp(token_log_prob).detach() * token_log_prob
+    else:
+        raise ValueError(f"Unsupported supervised loss type {loss_type!r}; expected 'sft' or 'dft'")
+
+    # NOTE: loss is averaged over all tokens in the batch across all data parallel groups.
+    # For FSDP backend, the loss is directly used for backward; while for Megatron backend,
+    # the loss should be scaled by `num_microbatches` for pp schedule.
+    loss = masked_sum(token_loss, token_mask) / batch_num_tokens * dp_size
 
     return loss, {}
+
+
+def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    """Compute the standard supervised negative log-likelihood objective."""
+    return _supervised_loss(model_output=model_output, data=data, loss_type="sft")
+
+
+def dft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    """Compute DFT's stop-gradient probability-weighted NLL objective."""
+    return _supervised_loss(model_output=model_output, data=data, loss_type="dft")
+
+
+def get_supervised_loss_fn(loss_type: str):
+    """Return the configured pure supervised-training objective."""
+    loss_type = str(loss_type).lower()
+    loss_fns = {"sft": sft_loss, "dft": dft_loss}
+    if loss_type not in loss_fns:
+        raise ValueError(f"Unsupported trainer.loss_type {loss_type!r}; expected one of {sorted(loss_fns)}")
+    return loss_fns[loss_type]
 
 
 def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):

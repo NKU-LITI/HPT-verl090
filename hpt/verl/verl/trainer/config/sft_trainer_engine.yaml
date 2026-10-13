@@ -62,6 +62,10 @@ checkpoint:
 
 trainer:
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+  # Pure supervised objective: sft or dft
+  loss_type: sft
+
   default_hdfs_dir: null
   project_name: gsm8k-sft
   experiment_name: test

@@ -32,16 +32,20 @@ OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-sft}
 SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
 OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
 MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
-HPT_CALCULATE_LOG_PROBS=${HPT_CALCULATE_LOG_PROBS:-false}
+# Keep the vLLM token log-probs during migration verification.  The weight
+# version is only a counter; this is the observable check that the synchronized
+# rollout model still matches the pre-update actor.
+HPT_CALCULATE_LOG_PROBS=${HPT_CALCULATE_LOG_PROBS:-true}
 
 LR=${LR:-5e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B} # rope_theta=40000 and max_position_embeddings=16384
 EXP_NAME=${EXP_NAME:-"VERL090_${DATE}_${UNIFY_STRATEGY}-${OFFLINE_LOSS_TYPE}-${SFT_LOSS_COEF}_${MODEL}_gate@${SWITCH_GATE}_lr@${LR}_${TIME_TAG}"}
 MODEL_PATH=${MODEL_PATH:-/workplace/nankai/liting_space/LLM/$MODEL}
 DATA_DIR=${DATA_DIR:-$ROOT/data}
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-"$ROOT/rollout/$EXP_NAME"}
 
 cd $ROOT/hpt/verl/
-mkdir -p $ROOT/checkpoints/$EXP_NAME
+mkdir -p $ROOT/checkpoints/$EXP_NAME "$ROLLOUT_DATA_DIR"
 
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
 TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/test.parquet","${DATA_DIR}/MATH-500/test.parquet"]}
@@ -125,5 +129,6 @@ python3 -m verl.trainer.main_ppo \
     data.shuffle=True \
     trainer.total_epochs=1 \
     trainer.default_local_dir=$ROOT/checkpoints/$EXP_NAME \
+    trainer.rollout_data_dir="$ROLLOUT_DATA_DIR" \
     trainer.resume_mode=auto \
     "$@"

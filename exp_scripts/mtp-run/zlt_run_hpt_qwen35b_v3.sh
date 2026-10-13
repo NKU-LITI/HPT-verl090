@@ -83,30 +83,40 @@ export HCCL_OP_EXPANSION_MODE=AIV
 # pip install torch_npu==2.9.0
 python -c "import torch;import torch_npu;print(torch_npu.npu.is_available())"
 
+
 # ================= 数据集 & 奖励函数路径（xyi） =================
 
 BASE_PATH=${BASE_PATH:-${zlt_data}}
 echo "BASE_PATH resolved to: ${BASE_PATH}"
 
 DATA_DIR=${DATA_DIR:-"${BASE_PATH}/HPT_data"}
-TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
+# TRAIN_FILE=${TRAIN_FILE:-"${BASE_PATH}/xyi_data/math_problem_no_length_overflow.parquet"} # xyi.parquet
+TRAIN_FILE=${TRAIN_FILE:-"${BASE_PATH}/xyi_data/xyi_2_16.parquet"} # xyi.parquet # math_problem_no_length_overflow
+
 TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/test.parquet","${DATA_DIR}/MATH-500/test.parquet"]}
 
 pip install "accelerate>=1.6.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
 python -c "import accelerate; print(accelerate.__version__)"
 
+pip install latex2sympy2_extended -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -c "import latex2sympy2_extended; print('ok')"
+
+pip install math_verify -i https://pypi.tuna.tsinghua.edu.cn/simple
 # ===============================================================
 
-MODEL_PATH=${MODEL_PATH:-${cq_qwen_datasets}/opensource_multimodal_models_guiyang/Qwen/Qwen3.5-35B-A3B/Qwen/Qwen3___5-35B-A3B}
+MODEL_PATH=${MODEL_PATH:-${cq_qwen_datasets}/opensource_multimodal_models_guiyang/Qwen/Qwen3.5-35B-A3B/Qwen/Qwen3___5-35B-A3B} 
 
 NNODES=${NNODES:-$MA_NUM_HOSTS}
 EXPERIMENT_NAME=${EXPERIMENT_NAME}
 
-PROJECT_NAME=${PROJECT_NAME:-VERL090_MTP_${DATE}_GRPO_Qwen35-35B-A3B_lr@${LR}_${TIME_TAG}}_${TIMESTAMP}}
 
 # ================= TensorBoard 输出目录（带时间戳） =================
 TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
-TENSORBOARD_DIR="${BASE_PATH}/${PROJECT_NAME}/tensorboard/"
+PROJECT_NAME=${PROJECT_NAME:-VERL090_RIGHT_MTP_${DATE}_HPT_Qwen35-35B-A3B_lr@${LR}_${TIME_TAG}_${TIMESTAMP}}
+
+
+TENSORBOARD_DIR="${BASE_PATH}/tensorboard/${PROJECT_NAME}/"
 mkdir -p "${TENSORBOARD_DIR}"
 echo "TENSORBOARD_DIR = ${TENSORBOARD_DIR}"
 # ====================================================================
@@ -114,10 +124,11 @@ echo "TENSORBOARD_DIR = ${TENSORBOARD_DIR}"
 NGPUS_PER_NODE=${MA_NUM_GPUS:-8}
 
 # ================= 规则奖励（rule-only）配置 =================
-# 不启用 GenRM，也不启动 reward_model router。
-# 使用 verify_choice_answer.py 的 auto 模式比对模型输出和 ground_truth。
+# 不启用 GenRM，也不启动 reward_model router
+# reward 走 verl/utils/reward_score/__init__.py:default_compute_score
+# 按 data_source=="mm_k12_math" 分发到 mm_k12_math_penalty_07311944.compute_score
+# 若需要切换规则函数（如换用 mm_k12_math_penalty_new），修改 __init__.py 里 mm_k12_math 分支即可
 REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-16}
-REWARD_FN_PATH=${REWARD_FN_PATH:-"${PROJECT_ROOT}/hpt/verl/verl/mix_src/verify_choice_answer.py"}
 # ========================================================================
 
 
@@ -129,34 +140,48 @@ TRAINER_NNODES=${TRAINER_NNODES:-$NNODES}
 
 
 # TRAIN_BATCH_SIZE 和 PPO_MINI_BATCH_SIZE设置成卡数
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-64}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-2048}
-PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}
+# train_batch_size * 卡数 得是 mini_batch_size的整数倍
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-96}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-6}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192} 
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-12888}
 
-ACTOR_LR=${ACTOR_LR:-1e-6}
+ACTOR_LR=${ACTOR_LR:-5e-6}
 PPO_EPOCHS=${PPO_EPOCHS:-1}
 CLIP_RATIO=${CLIP_RATIO:-0.2}
 GRAD_CLIP=${GRAD_CLIP:-1.0}
 
-ROLLOUT_TP=${ROLLOUT_TP:-4}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.7}
+ROLLOUT_TP=${ROLLOUT_TP:-8}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.45}
 ROLLOUT_N=${ROLLOUT_N:-8}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 ROLLOUT_TOP_P=${ROLLOUT_TOP_P:-0.99}
 
-DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-${BASE_PATH}/${PROJECT_NAME}/ckpt/}
+DEFAULT_LOCAL_DIR=${DEFAULT_LOCAL_DIR:-${BASE_PATH}/ckpt/${PROJECT_NAME}/}
 
-LOG_PATH=${LOG_PATH:-${BASE_PATH}/${PROJECT_NAME}/log/}
+LOG_PATH=${LOG_PATH:-${BASE_PATH}/log/${PROJECT_NAME}/}
 echo "LOG_PATH resolved to: ${LOG_PATH}"
 
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-${BASE_PATH}/rollout/${PROJECT_NAME}/}
+echo "ROLLOUT_DATA_DIR resolved to: ${ROLLOUT_DATA_DIR}"
 
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-2}
-SAVE_FREQ=${SAVE_FREQ:-50}
-VAL_FREQ=${VAL_FREQ:-10}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
+SAVE_FREQ=${SAVE_FREQ:-10}
+VAL_FREQ=${VAL_FREQ:-20}
 
-MAX_MODEL_LEN=${MAX_MODEL_LEN:-3200}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-12888}
+
+
+# [HPT]
+UNIFY_STRATEGY="switch"
+SWITCH_GATE=${SWITCH_GATE:-0}
+OFFLINE_LOSS_TYPE=${OFFLINE_LOSS_TYPE:-sft}
+SFT_LOSS_COEF=${SFT_LOSS_COEF:-1.0}
+OFF_POLICY_BETA=${OFF_POLICY_BETA:-0.1}
+MAX_GRAD_NORM=${MAX_GRAD_NORM:-80.0}
+
+
 
 ### 启动分布式网络配置（多节点）
 NODE_RANK=${VC_TASK_INDEX:-0}
@@ -172,7 +197,6 @@ export NPUS_PER_NODE=8
 export WORLD_SIZE=$(( NNODES * NPUS_PER_NODE ))
 
 readonly SOCKET_IFNAME="eth0"
-
 
 export RAY_DEDUP_LOGS=0
 export HCCL_SOCKET_IFNAME=$SOCKET_IFNAME
@@ -198,6 +222,7 @@ export RAY_gcs_actor_failure_grace_period_ms=60000
 
 echo $RAY_gcs_rpc_server_reconnect_timeout_s
 
+npu-smi info
 
 # ================= 多节点：启动 Ray 集群 =================
 if [ "${NODE_RANK}" = "0" ]; then
@@ -220,7 +245,7 @@ if [ "${NODE_RANK}" = "0" ]; then
             echo "Ray cluster ready: ${device_count} nodes"
             ray status
 
-            mkdir -p ${LOG_PATH}
+            mkdir -p "${LOG_PATH}" "${ROLLOUT_DATA_DIR}"
 
             python3 -m verl.trainer.main_ppo \
                 algorithm.adv_estimator=grpo \
@@ -257,13 +282,12 @@ if [ "${NODE_RANK}" = "0" ]; then
                 actor_rollout_ref.actor.kl_loss_coef=0.01 \
                 actor_rollout_ref.actor.kl_loss_type=low_var_kl \
                 actor_rollout_ref.actor.entropy_coeff=0 \
-                actor_rollout_ref.actor.calculate_entropy=False \
                 actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
+                actor_rollout_ref.actor.calculate_entropy=False \
                 actor_rollout_ref.actor.policy_loss.loss_mode=grpo_compat \
                 actor_rollout_ref.actor.policy_loss.loss_remove_token_mean=True \
                 actor_rollout_ref.actor.policy_loss.loss_remove_clip=True \
                 actor_rollout_ref.actor.use_kl_loss=False \
-                actor_rollout_ref.actor.entropy_coeff=0.001 \
                 actor_rollout_ref.actor.use_torch_compile=False \
                 actor_rollout_ref.actor.fsdp_config.param_offload=True \
                 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
@@ -292,11 +316,19 @@ if [ "${NODE_RANK}" = "0" ]; then
                 actor_rollout_ref.rollout.enable_chunked_prefill=False \
                 actor_rollout_ref.rollout.free_cache_engine=True \
                 actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
-                reward.num_workers=${REWARD_NUM_WORKERS} \
-                reward.custom_reward_function.path="${REWARD_FN_PATH}" \
+                reward.custom_reward_function.path="verl/experimental/hpt/reward.py" \
                 reward.custom_reward_function.name=compute_score \
-                reward.reward_manager.source=register \
-                reward.reward_manager.name=naive \
+                reward.reward_manager.source=importlib \
+                reward.reward_manager.name=LegacyHPTRewardManager \
+                reward.reward_manager.module.path="verl/experimental/hpt/reward_manager.py" \
+                +hpt.enabled=True \
+                +hpt.strategy="$UNIFY_STRATEGY" \
+                +hpt.switch_gate=$SWITCH_GATE \
+                +hpt.success_reward=1.0 \
+                +hpt.offline_loss_type="$OFFLINE_LOSS_TYPE" \
+                +hpt.sft_loss_coef=$SFT_LOSS_COEF \
+                +hpt.off_policy_beta=$OFF_POLICY_BETA \
+                +hpt.max_grad_norm=$MAX_GRAD_NORM \
                 trainer.balance_batch=True \
                 trainer.logger='["console","tensorboard"]' \
                 trainer.project_name=${PROJECT_NAME} \
@@ -305,21 +337,22 @@ if [ "${NODE_RANK}" = "0" ]; then
                 trainer.nnodes=${TRAINER_NNODES} \
                 trainer.device=npu \
                 trainer.default_local_dir=${DEFAULT_LOCAL_DIR} \
-                trainer.val_before_train=True \
+                trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}" \
+                trainer.val_before_train=False \
                 trainer.save_freq=${SAVE_FREQ} \
                 trainer.test_freq=${VAL_FREQ} \
                 trainer.total_epochs=${TOTAL_EPOCHS} 2>&1 | tee -a ${LOG_PATH}/${SAVELOG_FILE_NAME}
             python_exit_code=${PIPESTATUS[0]}
             if [ "${python_exit_code}" -ne 0 ]; then
                 echo "Training failed with exit code ${python_exit_code}...."
-                sleep 3h
+                sleep 30h
                 exit ${python_exit_code}
             fi
             break
         fi
 
         echo "Waiting for Ray nodes. Current=${device_count}, expected=${NNODES}"
-        sleep 1000
+        sleep 10
     done
 else
     echo "Ray Head is up! Starting worker..."

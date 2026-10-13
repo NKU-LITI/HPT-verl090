@@ -119,6 +119,29 @@ def test_sender_accepts_strided_tensor(monkeypatch):
     assert torch.equal(recovered, weight)
 
 
+def test_retained_weight_stream_clones_reused_bucket_storage(monkeypatch):
+    """A layerwise loader may retain a tensor after requesting the next bucket."""
+    from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+    receiver = object.__new__(BucketedWeightReceiver)
+    reusable = torch.tensor([1.0])
+
+    def iter_reused_buckets():
+        yield [("first", reusable)], False
+        reusable.fill_(2.0)
+        yield [("second", reusable)], True
+
+    monkeypatch.setattr(receiver, "iter_weight_buckets", iter_reused_buckets)
+    stream = receiver.iter_weights(clone_for_retention=True)
+    first_name, first = next(stream)
+    second_name, second = next(stream)
+
+    assert first_name == "first"
+    assert second_name == "second"
+    torch.testing.assert_close(first, torch.tensor([1.0]))
+    torch.testing.assert_close(second, torch.tensor([2.0]))
+
+
 # ---------------------------------------------------------------------------
 # Process entry points (must be module-level for pickling with spawn)
 # ---------------------------------------------------------------------------

@@ -261,22 +261,18 @@ class BucketedWeightReceiver:
         self.buffer = None
         self.shm = None
 
-    def receive_weights(self, on_bucket_received: callable):
-        """
-        Receive weights from sender and process each bucket via callback.
+    def iter_weight_buckets(self):
+        """Yield one received weight bucket at a time.
 
-        Args:
-            on_bucket_received: Callback function(weights: list[(name, tensor)],
-            is_last: bool) called per bucket. ``is_last`` marks the final bucket
-            of a weight-sync round so consumers that need the complete tensor set
-            (e.g. vLLM ``add_lora``, which takes one adapter dict per call) can
-            defer their finalization until the whole adapter has arrived.
+        The acknowledgement for a bucket is sent only after the caller has
+        consumed the yielded bucket.  This lets vLLM's native streaming reload
+        consume a single iterator spanning all transport buckets while still
+        preventing the sender from reusing the IPC buffer too early.
         """
         try:
             self._init_socket()
             self._init_buffer()
 
-            # receive bucket and update weights
             while True:
                 metadata = self.socket.recv_pyobj()
                 weights, tensor = [], None
@@ -291,8 +287,12 @@ class BucketedWeightReceiver:
                     if self.use_shm:
                         tensor = tensor.to(self.device)
                     weights.append((name, tensor))
+
                 is_last = metadata["is_last"]
-                on_bucket_received(weights, is_last)
+                yield weights, is_last
+
+                # load_weights may enqueue asynchronous copies from the shared
+                # bucket.  Do not acknowledge/reuse it until those copies finish.
                 get_torch_device().synchronize()
                 self.socket.send(b"")
                 del weights, tensor
@@ -300,6 +300,36 @@ class BucketedWeightReceiver:
                     break
         finally:
             self._cleanup()
+
+    def iter_weights(self, *, clone_for_retention: bool = False):
+        """Yield a single weight stream across all transport buckets.
+
+        The ordinary bucket callback consumes every tensor before the bucket is
+        acknowledged, so views into the reusable IPC buffer are sufficient.
+        vLLM's layerwise reload path is different: its weight loaders retain
+        tensors until all shards of a layer have arrived.  In that case the
+        stream must own independent storage, otherwise the sender overwrites a
+        retained view when it fills the next bucket.
+        """
+        for weights, _is_last in self.iter_weight_buckets():
+            for name, tensor in weights:
+                if clone_for_retention:
+                    tensor = tensor.clone()
+                yield name, tensor
+
+    def receive_weights(self, on_bucket_received: callable):
+        """
+        Receive weights from sender and process each bucket via callback.
+
+        Args:
+            on_bucket_received: Callback function(weights: list[(name, tensor)],
+            is_last: bool) called per bucket. ``is_last`` marks the final bucket
+            of a weight-sync round so consumers that need the complete tensor set
+            (e.g. vLLM ``add_lora``, which takes one adapter dict per call) can
+            defer their finalization until the whole adapter has arrived.
+        """
+        for weights, is_last in self.iter_weight_buckets():
+            on_bucket_received(weights, is_last)
 
     def _init_socket(self):
         """Initialize ZMQ REP socket and connect."""

@@ -24,9 +24,10 @@ conda activate verl090
 
 export WANDB_PROJECT=${WANDB_PROJECT:-"luffy-srft-dft"}
 
+LOSS_TYPE=${LOSS_TYPE:-sft}
 LR=${LR:-5e-6}
 MODEL=${MODEL:-Qwen2.5-Math-7B} # rope_theta=40000 and max_position_embeddings=16384
-EXP_NAME=${EXP_NAME:-"VERL090_${DATE}_SFT_${MODEL}_lr@${LR}_${TIME_TAG}"}
+EXP_NAME=${EXP_NAME:-"VERL090_${DATE}_${LOSS_TYPE^^}_${MODEL}_lr@${LR}_${TIME_TAG}"}
 MODEL_PATH=${MODEL_PATH:-/workplace/nankai/liting_space/LLM/$MODEL}
 DATA_DIR=${DATA_DIR:-$ROOT/data}
 
@@ -87,6 +88,7 @@ python3 -m torch.distributed.run \
     optim.clip_grad=1.0 \
     optim.lr_scheduler_type=cosine \
     trainer.logger=['console','wandb'] \
+    trainer.loss_type=$LOSS_TYPE \
     trainer.project_name="$WANDB_PROJECT" \
     trainer.experiment_name="$EXP_NAME" \
     trainer.total_epochs=$TOTAL_EPOCHS \

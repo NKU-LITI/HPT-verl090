@@ -637,10 +637,17 @@ class _FakeBucketReceiver:
     def __init__(self, buckets):
         # buckets: list of (weights_list, is_last)
         self._buckets = buckets
+        self.clone_for_retention = None
 
     def receive_weights(self, on_bucket_received):
         for weights, is_last in self._buckets:
             on_bucket_received(weights, is_last)
+
+    def iter_weights(self, *, clone_for_retention=False):
+        self.clone_for_retention = clone_for_retention
+        for weights, _is_last in self._buckets:
+            for name, tensor in weights:
+                yield name, tensor.clone() if clone_for_retention else tensor
 
 
 def test_update_weights_from_ipc_accumulates_lora_across_buckets(monkeypatch):
@@ -718,3 +725,47 @@ def test_update_weights_from_ipc_standard_loads_per_bucket(monkeypatch):
     worker.update_weights_from_ipc(peft_config=None, base_sync_done=False)
 
     assert loaded == ["q.weight", "k.weight"]
+
+
+def test_update_weights_from_ipc_uses_native_streaming_reload(monkeypatch):
+    """Native reload owns weights that may outlive the reusable IPC bucket."""
+    import verl.workers.rollout.vllm_rollout.bucketed_weight_transfer as bwt
+
+    receivers = []
+
+    def make_receiver(*args, **kwargs):
+        receiver = _FakeBucketReceiver(
+            [
+                ([("q.weight", torch.ones(1))], False),
+                ([("k.weight", torch.zeros(1))], True),
+            ]
+        )
+        receivers.append(receiver)
+        return receiver
+
+    monkeypatch.setattr(
+        bwt,
+        "BucketedWeightReceiver",
+        make_receiver,
+    )
+
+    model = _FakeModel({"q.weight": torch.empty(0), "k.weight": torch.empty(0)})
+    worker = _make_worker(model)
+    worker.device = torch.device("cpu")
+    worker.local_rank = 0
+    worker._is_qat_model = False
+    worker._is_modelopt_qat = False
+    worker._get_zmq_handle = lambda: "ipc:///tmp/test-bucketed-native-reload.sock"
+
+    calls = []
+
+    def reload_weights(*, weights_iterator, is_checkpoint_format):
+        calls.append((list(weights_iterator), is_checkpoint_format))
+
+    worker.model_runner.reload_weights = reload_weights
+    worker.update_weights_from_ipc(peft_config=None, base_sync_done=False)
+
+    assert len(calls) == 1
+    assert [name for name, _ in calls[0][0]] == ["q.weight", "k.weight"]
+    assert calls[0][1] is True
+    assert receivers[0].clone_for_retention is True

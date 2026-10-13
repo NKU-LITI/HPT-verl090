@@ -39,9 +39,10 @@ MODEL=${MODEL:-Qwen2.5-Math-7B} # rope_theta=40000 and max_position_embeddings=1
 EXP_NAME=${EXP_NAME:-"VERL090_${DATE}_HPT_verify_${MODEL}_gate@${SWITCH_GATE}_lr@${LR}_${TIME_TAG}"}
 MODEL_PATH=${MODEL_PATH:-/workplace/nankai/liting_space/LLM/$MODEL}
 DATA_DIR=${DATA_DIR:-$ROOT/data}
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-"$ROOT/rollout/$EXP_NAME"}
 
 cd $ROOT/hpt/verl/
-mkdir -p $ROOT/checkpoints/$EXP_NAME
+mkdir -p $ROOT/checkpoints/$EXP_NAME "$ROLLOUT_DATA_DIR"
 
 TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
 TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/test.parquet","${DATA_DIR}/MATH-500/test.parquet"]}
@@ -127,5 +128,6 @@ python3 -m verl.trainer.main_ppo \
     data.shuffle=True \
     trainer.total_epochs=1 \
     trainer.default_local_dir=$ROOT/checkpoints/$EXP_NAME \
+    trainer.rollout_data_dir="$ROLLOUT_DATA_DIR" \
     trainer.resume_mode=auto \
     "$@"

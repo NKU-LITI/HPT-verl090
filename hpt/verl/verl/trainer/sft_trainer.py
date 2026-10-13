@@ -158,9 +158,10 @@ class SFTTrainer:
 
     def _build_engine(self):
         from verl.workers.engine_workers import TrainingWorkerConfig
-        from verl.workers.utils.losses import sft_loss
+        from verl.workers.utils.losses import get_supervised_loss_fn
 
-        self.loss_fn = partial(sft_loss, config=None)
+        loss_type = self.config.trainer.get("loss_type", "sft")
+        self.loss_fn = partial(get_supervised_loss_fn(loss_type), config=None)
 
         config = TrainingWorkerConfig(
             model_type="language_model",

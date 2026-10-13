@@ -283,31 +283,56 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
-        # LoRA adapters need a single complete tensor dict per ``add_lora``, but
-        # the bucketed transport may split one across buckets. Accumulate and
-        # apply only after ``is_last``; standard base weights load per bucket.
-        lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
+        native_reload = getattr(self.model_runner, "reload_weights", None)
+        use_native_reload = (
+            callable(native_reload)
+            and not self._is_qat_model
+            and not self._is_modelopt_qat
+            and not (peft_config and base_sync_done)
+            and not is_fp8_model(self.model_runner.vllm_config)
+            and not self._use_mtp_drafter_weight_sync()
+        )
 
-        def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
-            if lora_weights is not None:
-                # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
-                lora_weights.update((name, tensor.clone()) for name, tensor in weights)
-                if not is_last:
+        if use_native_reload:
+            # vLLM 0.24 records reload metadata when the model is built.  Its
+            # native reload path consumes the complete HF checkpoint stream,
+            # groups fused QKV/MLP shards by layer, and finalizes the reload
+            # exactly once.  Its layerwise loaders retain input tensors while
+            # collecting a layer, so they must not retain views into the
+            # reusable IPC bucket.  Clone each tensor before acknowledging its
+            # bucket; otherwise the next send silently overwrites weights that
+            # vLLM has not processed yet.
+            native_reload(
+                weights_iterator=receiver.iter_weights(clone_for_retention=True),
+                is_checkpoint_format=True,
+            )
+            logger.info("Reloaded standard vLLM weights through the native streaming reload path")
+        else:
+            # LoRA adapters need a single complete tensor dict per ``add_lora``, but
+            # the bucketed transport may split one across buckets. Accumulate and
+            # apply only after ``is_last``; legacy/quantized base weights load per bucket.
+            lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
+
+            def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+                if lora_weights is not None:
+                    # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
+                    lora_weights.update((name, tensor.clone()) for name, tensor in weights)
+                    if not is_last:
+                        return
+                    self._update_weights(
+                        list(lora_weights.items()),
+                        peft_config=peft_config,
+                        base_sync_done=base_sync_done,
+                    )
+                    lora_weights.clear()
                     return
                 self._update_weights(
-                    list(lora_weights.items()),
+                    weights,
                     peft_config=peft_config,
                     base_sync_done=base_sync_done,
                 )
-                lora_weights.clear()
-                return
-            self._update_weights(
-                weights,
-                peft_config=peft_config,
-                base_sync_done=base_sync_done,
-            )
 
-        receiver.receive_weights(on_bucket_received=on_bucket_received)
+            receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
         if self._is_qat_model:
@@ -329,7 +354,7 @@ class vLLMColocateWorkerExtension:
 
             for model, reload_state in quant_reload_states:
                 process_quanted_weights_after_loading(model, reload_state)
-        else:
+        elif not use_native_reload:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
