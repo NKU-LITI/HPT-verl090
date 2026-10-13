@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import json
 import os
 from functools import partial
 
@@ -160,8 +161,8 @@ class SFTTrainer:
         from verl.workers.engine_workers import TrainingWorkerConfig
         from verl.workers.utils.losses import get_supervised_loss_fn
 
-        loss_type = self.config.trainer.get("loss_type", "sft")
-        self.loss_fn = partial(get_supervised_loss_fn(loss_type), config=None)
+        self.loss_type = str(self.config.trainer.get("loss_type", "sft")).lower()
+        self.loss_fn = partial(get_supervised_loss_fn(self.loss_type), config=None)
 
         config = TrainingWorkerConfig(
             model_type="language_model",
@@ -306,6 +307,64 @@ class SFTTrainer:
         batch_seqlens = output_tensor.tolist()
         return batch_seqlens
 
+    def _dump_supervised_data(self, data, global_step):
+        """Dump the prompt/target pairs consumed by this supervised step."""
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if not rollout_data_dir or not self.engine.is_mp_src_rank_with_outputs():
+            return
+
+        input_rows = data["input_ids"].unbind()
+        loss_mask_rows = data["loss_mask"].unbind()
+        if "attention_mask" in data:
+            attention_mask_rows = data["attention_mask"].unbind()
+        else:
+            attention_mask_rows = [None] * len(input_rows)
+
+        local_records = []
+        tokenizer = self.model_config.tokenizer
+        for input_ids, loss_mask, attention_mask in zip(
+            input_rows, loss_mask_rows, attention_mask_rows, strict=True
+        ):
+            valid_mask = torch.ones_like(loss_mask, dtype=torch.bool)
+            if attention_mask is not None:
+                valid_mask = attention_mask.bool()
+            target_mask = loss_mask.bool() & valid_mask
+            prompt_mask = ~loss_mask.bool() & valid_mask
+
+            prompt_ids = input_ids[prompt_mask].detach().cpu().tolist()
+            target_ids = input_ids[target_mask].detach().cpu().tolist()
+            target = tokenizer.decode(target_ids, skip_special_tokens=True)
+            local_records.append(
+                {
+                    "input": tokenizer.decode(prompt_ids, skip_special_tokens=True),
+                    "output": target,
+                    "gts": target,
+                    "score": None,
+                    "step": global_step,
+                    "loss_type": self.loss_type,
+                }
+            )
+
+        dp_size = self.engine.get_data_parallel_size()
+        dp_group = self.engine.get_data_parallel_group()
+        if dp_size > 1:
+            records_by_rank = [None] * dp_size
+            torch.distributed.all_gather_object(records_by_rank, local_records, group=dp_group)
+            records = [record for rank_records in records_by_rank for record in rank_records]
+        else:
+            records = local_records
+
+        if self.engine.get_data_parallel_rank() != 0:
+            return
+
+        rollout_data_dir = os.path.expanduser(str(rollout_data_dir))
+        os.makedirs(rollout_data_dir, exist_ok=True)
+        filename = os.path.join(rollout_data_dir, f"{global_step}.jsonl")
+        with open(filename, "w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        print(f"Dumped supervised data to {filename}")
+
     def fit(self):
         is_logging = self.engine.is_mp_src_rank_with_outputs() and self.engine.get_data_parallel_rank() == 0
 
@@ -370,6 +429,8 @@ class SFTTrainer:
                 )
             ):
                 global_step += 1
+
+                self._dump_supervised_data(data, global_step)
 
                 # construct tensordict
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)

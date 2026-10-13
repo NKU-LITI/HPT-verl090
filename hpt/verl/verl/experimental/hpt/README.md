@@ -127,6 +127,6 @@
 | 选项解析、逗号切分、标签识别、去单位 | `answer_rules.py` |
 | 调用 legacy 判题器 | 选择题：`grade` 里，传入 `</think>` 之后的全文；单空：`field_equal` 里，传入 `\boxed{答案}` |
 | legacy 判题器 | `legacy_entropy_math.py` |
-| 回复长度注入（verl 0.9.0） | `reward_manager.py` |
+| 回复长度注入（verl 0.9.0） | `reward_manager_origin.py` |
 | 单元测试 | `tests/test_reward.py` |
 | rollout 对比评测 | `tests/eval_rollouts.py` |

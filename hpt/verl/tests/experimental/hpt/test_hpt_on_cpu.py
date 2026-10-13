@@ -38,7 +38,7 @@ from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_h
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
 from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
 from verl.experimental.hpt.reward import legacy_reward_input
-from verl.experimental.hpt.reward_manager import decode_legacy_response
+from verl.experimental.hpt.reward_manager_origin import decode_legacy_response
 from verl.mix_src.legacy_rollout import legacy_equal_request_priorities
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.trainer.ppo.ray_trainer import (

@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
-from verl.experimental.hpt.reward_manager import decode_legacy_response
+from verl.experimental.hpt.reward_manager_origin import decode_legacy_response
 from verl.utils.model import compute_position_id_with_mask
 
 
@@ -293,10 +293,21 @@ def apply_hpt(
         valid_response_ids = selected.batch["responses"][row, :valid_response_length]
         decoded_response = decode_legacy_response(tokenizer, valid_response_ids)
         reward_model = selected.non_tensor_batch["reward_model"][row]
+        response_width = selected.batch["responses"].shape[-1]
+        eos_token_id = tokenizer.eos_token_id
+        ends_with_eos = (
+            eos_token_id is not None
+            and valid_response_length > 0
+            and int(valid_response_ids[-1].item()) == eos_token_id
+        )
         target_reward = compute_hpt_reward(
             data_source=selected.non_tensor_batch["data_source"][row],
             solution_str=decoded_response,
             ground_truth=reward_model["ground_truth"],
+            extra_info={"response_length": valid_response_length},
+            # A full-width target ending in EOS is complete; a full-width
+            # target without EOS was truncated by ``_tokenize_target``.
+            max_response_length=response_width + int(ends_with_eos),
         )
         selected_rewards[row].zero_()
         selected_rewards[row, valid_response_length - 1] = target_reward

@@ -11,9 +11,10 @@
 import inspect
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 
 from verl import DataProto
-from verl.experimental.hpt.reward import compute_score_in_process
+from verl.experimental.hpt.reward import RESPONSE_LENGTH_KEY, compute_score_in_process
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
 
@@ -43,7 +44,7 @@ class LegacyHPTRewardManager(RewardManagerBase):
         data_item = data[-1:][0]
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+        valid_response_length = int(data_item.batch["attention_mask"][-response_length:].sum())
         valid_response_ids = response_ids[:valid_response_length]
 
         response_str = await self.loop.run_in_executor(
@@ -51,12 +52,14 @@ class LegacyHPTRewardManager(RewardManagerBase):
         )
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        # The same dict can be shared by all rollouts of one prompt.
+        extra_info = dict(data_item.non_tensor_batch.get("extra_info") or {})
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:
             extra_info.update(tool_extra_fields.items())
         extra_info["num_turns"] = data_item.non_tensor_batch.get("__num_turns__", None)
         extra_info["rollout_reward_scores"] = data_item.non_tensor_batch.get("reward_scores", {})
+        extra_info[RESPONSE_LENGTH_KEY] = valid_response_length
 
         extra_reward_kwargs = (
             {
@@ -72,15 +75,20 @@ class LegacyHPTRewardManager(RewardManagerBase):
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
+                max_response_length=response_length,
                 **extra_reward_kwargs,
             )
         else:
             result = await self.loop.run_in_executor(
                 self._legacy_score_executor,
-                compute_score_in_process,
-                data_source,
-                response_str,
-                ground_truth,
+                partial(
+                    compute_score_in_process,
+                    data_source,
+                    response_str,
+                    ground_truth,
+                    extra_info,
+                    max_response_length=response_length,
+                ),
             )
 
         if isinstance(result, dict):

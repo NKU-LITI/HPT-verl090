@@ -16,7 +16,7 @@ from .legacy_entropy_math import extract_answer
 
 THINK_END = "</think>"
 DEFAULT_MAX_RESPONSE_LENGTH = 8192
-# Key filled by ``LengthAwareNaiveRewardManager`` with the valid response token count.
+# Key filled by ``LegacyHPTRewardManager`` with the valid response token count.
 RESPONSE_LENGTH_KEY = "response_length"
 
 
@@ -100,12 +100,12 @@ def compute_score(
 
     A response whose token length reaches ``max_response_length`` is treated as
     unfinished and scored 0. The token length must be supplied in
-    ``extra_info["response_length"]`` (see ``reward_manager.py``).
+    ``extra_info["response_length"]`` (see ``reward_manager_origin.py``).
     """
     del data_source, kwargs
     if not extra_info or extra_info.get(RESPONSE_LENGTH_KEY) is None:
         raise ValueError(
-            f"extra_info[{RESPONSE_LENGTH_KEY!r}] is required; use LengthAwareNaiveRewardManager"
+            f"extra_info[{RESPONSE_LENGTH_KEY!r}] is required; use LegacyHPTRewardManager"
         )
     if int(extra_info[RESPONSE_LENGTH_KEY]) >= max_response_length:
         return 0.0

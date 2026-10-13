@@ -121,11 +121,11 @@ python3.10 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.use_torch_compile=False \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    reward.custom_reward_function.path="$ROOT/hpt/verl/verl/experimental/hpt/reward.py" \
+    reward.custom_reward_function.path="pkg://verl.experimental.hpt.reward" \
     reward.custom_reward_function.name=compute_score \
     reward.reward_manager.source=importlib \
     reward.reward_manager.name=LegacyHPTRewardManager \
-    reward.reward_manager.module.path="$ROOT/hpt/verl/verl/experimental/hpt/reward_manager.py" \
+    reward.reward_manager.module.path="pkg://verl.experimental.hpt.reward_manager_origin" \
     +hpt.enabled=True \
     +hpt.strategy="$UNIFY_STRATEGY" \
     +hpt.switch_gate=$SWITCH_GATE \

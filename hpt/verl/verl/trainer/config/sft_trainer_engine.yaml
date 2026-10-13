@@ -66,6 +66,10 @@ trainer:
   # Pure supervised objective: sft or dft
   loss_type: sft
 
+  # Directory for dumping the supervised prompt/target pairs used at each step.
+  # The JSONL schema and per-step filenames match PPO rollout dumps.
+  rollout_data_dir: null
+
   default_hdfs_dir: null
   project_name: gsm8k-sft
   experiment_name: test
