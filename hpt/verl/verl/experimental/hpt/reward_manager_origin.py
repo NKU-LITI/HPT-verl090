@@ -11,12 +11,53 @@
 import inspect
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
+from functools import lru_cache, partial
 
 from verl import DataProto
-from verl.experimental.hpt.reward import RESPONSE_LENGTH_KEY, compute_score_in_process
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
+from verl.utils.import_utils import load_extern_object
 from verl.utils.reward_score import default_compute_score
+
+RESPONSE_LENGTH_KEY = "response_length"
+
+
+@lru_cache(maxsize=None)
+def _load_configured_score(module_path: str, function_name: str):
+    """Load the configured scorer inside the spawned reward process."""
+    return load_extern_object(module_path=module_path, object_name=function_name)
+
+
+def _compute_configured_score_in_process(
+    module_path: str,
+    function_name: str,
+    reward_kwargs: dict,
+    *,
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info,
+    max_response_length: int,
+):
+    """Invoke the selected custom scorer without pickling the function object.
+
+    File-loaded functions are not reliably pickleable with the ``spawn`` start
+    method.  Passing the module specification lets the worker import either the
+    origin scorer or the current scorer itself while retaining SIGALRM support.
+    """
+    compute_score = _load_configured_score(module_path, function_name)
+    call_kwargs = {
+        "extra_info": extra_info,
+        "max_response_length": max_response_length,
+    }
+    # Match trainer.ppo.reward._call_with_kwargs: configured kwargs win over
+    # values supplied by the reward manager.
+    call_kwargs.update(reward_kwargs)
+    return compute_score(
+        data_source=data_source,
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        **call_kwargs,
+    )
 
 
 def decode_legacy_response(tokenizer, response_ids) -> str:
@@ -33,6 +74,10 @@ class LegacyHPTRewardManager(RewardManagerBase):
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
+        reward_fn_config = config.reward.get("custom_reward_function") or {}
+        self.custom_reward_path = reward_fn_config.get("path")
+        self.custom_reward_name = reward_fn_config.get("name")
+        self.custom_reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
         # verl 0.1 scored serially in the process main thread. verl 0.9's
         # reward loop sends synchronous functions to a ThreadPoolExecutor,
         # where entropy_math's SIGALRM guards either fail closed or must be
@@ -79,17 +124,29 @@ class LegacyHPTRewardManager(RewardManagerBase):
                 **extra_reward_kwargs,
             )
         else:
-            result = await self.loop.run_in_executor(
-                self._legacy_score_executor,
-                partial(
-                    compute_score_in_process,
-                    data_source,
-                    response_str,
-                    ground_truth,
-                    extra_info,
+            if self.custom_reward_path and self.custom_reward_name:
+                score_call = partial(
+                    _compute_configured_score_in_process,
+                    self.custom_reward_path,
+                    self.custom_reward_name,
+                    self.custom_reward_kwargs,
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
                     max_response_length=response_length,
-                ),
-            )
+                )
+            else:
+                score_call = partial(
+                    self.compute_score,
+                    data_source=data_source,
+                    solution_str=response_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                    max_response_length=response_length,
+                    **extra_reward_kwargs,
+                )
+            result = await self.loop.run_in_executor(self._legacy_score_executor, score_call)
 
         if isinstance(result, dict):
             score = result["score"]

@@ -48,7 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.reward import extract_reward, get_custom_reward_fn
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -1692,12 +1692,16 @@ class RayPPOTrainer:
                         from verl.experimental.hpt.algorithm import apply_hpt
 
                         actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        hpt_compute_score = get_custom_reward_fn(self.config)
+                        if hpt_compute_score is None:
+                            raise ValueError("hpt.enabled=True requires reward.custom_reward_function")
                         batch, reward_tensor, hpt_metrics = apply_hpt(
                             batch=batch,
                             reward_tensor=reward_tensor,
                             tokenizer=self.tokenizer,
                             config=hpt_config,
                             dp_size=actor_dp_size,
+                            compute_score=hpt_compute_score,
                         )
                         _attach_hpt_reward(batch, reward_tensor)
                         metrics.update(hpt_metrics)

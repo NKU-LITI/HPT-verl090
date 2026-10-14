@@ -2,7 +2,8 @@
 
 The original reward is the canonical wrapper before this repo's changes:
 ``legacy compute_score("<think>\\n" + response, ground_truth)``. The current
-reward is ``reward.compute_score`` with the recorded ``response_length``.
+reward is ``reward.compute_score``. Recorded length metadata is still passed
+for interface compatibility but is not part of the current verdict.
 
 Run from the verifier directory:
     uv run --no-project --with "math-verify[antlr4_13_2]==0.9.0" --with sympy \

@@ -90,7 +90,7 @@ echo "BASE_PATH resolved to: ${BASE_PATH}"
 
 DATA_DIR=${DATA_DIR:-"${BASE_PATH}/HPT_data"}
 # TRAIN_FILE=${TRAIN_FILE:-"${DATA_DIR}/openr1.1024.4096.sample.parquet"}
-TRAIN_FILE=${TRAIN_FILE:-"${BASE_PATH}/xyi_data/xyi_2_16.parquet"} # xyi.parquet # math_problem_no_length_overflow
+TRAIN_FILE=${TRAIN_FILE:-"${BASE_PATH}/xyi_data/xyi_2_16_1013.parquet"} # xyi.parquet # math_problem_no_length_overflow
 
 TEST_FILE=${TEST_FILE:-["${DATA_DIR}/AIME24/test.parquet","${DATA_DIR}/AMC23/test.parquet"]}
 # TEST_FILE=${TEST_FILE:-["${DATA_DIR}/MATH-500/test.parquet"]}
@@ -122,11 +122,7 @@ echo "TENSORBOARD_DIR = ${TENSORBOARD_DIR}"
 NGPUS_PER_NODE=${MA_NUM_GPUS:-8}
 
 # ================= 规则奖励（rule-only）配置 =================
-# 不启用 GenRM，也不启动 reward_model router
-# reward 走 verl/utils/reward_score/__init__.py:default_compute_score
-# 按 data_source=="mm_k12_math" 分发到 mm_k12_math_penalty_07311944.compute_score
-# 若需要切换规则函数（如换用 mm_k12_math_penalty_new），修改 __init__.py 里 mm_k12_math 分支即可
-REWARD_NUM_WORKERS=${REWARD_NUM_WORKERS:-16}
+# 不启用 GenRM；由 LegacyHPTRewardManager 在独立进程中调用新版 HPT reward。
 # ========================================================================
 
 

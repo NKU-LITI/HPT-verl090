@@ -38,7 +38,7 @@ from verl.experimental.hpt.layout import balance_hpt_batch_like_reference, pad_h
 from verl.experimental.hpt.loss import compute_hpt_legacy_entropy_loss, compute_policy_loss_hpt
 from verl.experimental.hpt.reward import compute_score as compute_hpt_reward
 from verl.experimental.hpt.reward import legacy_reward_input
-from verl.experimental.hpt.reward_manager_origin import decode_legacy_response
+from verl.experimental.hpt.reward_manager_origin import _compute_configured_score_in_process, decode_legacy_response
 from verl.mix_src.legacy_rollout import legacy_equal_request_priorities
 from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.trainer.ppo.ray_trainer import (
@@ -114,7 +114,7 @@ class _Tokenizer:
 
     def decode(self, token_ids, skip_special_tokens=False):
         del token_ids
-        return "reasoning \\boxed{1}" + ("" if skip_special_tokens else "<eos>")
+        return "reasoning</think> \\boxed{1}" + ("" if skip_special_tokens else "<eos>")
 
 
 class _ActorConfig:
@@ -605,17 +605,41 @@ def test_target_normalization():
 
 def test_hpt_reward_uses_legacy_entropy_math_and_text_prefix():
     assert legacy_reward_input("reasoning \\boxed{1}<eos>") == "<think>\nreasoning \\boxed{1}<eos>"
-    assert compute_hpt_reward("math", "reasoning \\boxed{1}<eos>", "1") == 1.0
-    assert compute_hpt_reward("math", "reasoning \\boxed{2}<eos>", "1") == 0.0
+    assert compute_hpt_reward("math", "reasoning</think>\\boxed{1}<eos>", "1") == 1.0
+    assert compute_hpt_reward("math", "reasoning</think>\\boxed{2}<eos>", "1") == 0.0
+    assert compute_hpt_reward("math", "reasoning \\boxed{1}<eos>", "1") == 0.0
     assert compute_hpt_reward("math", "answer is 1", "1") == 0.0
-    assert decode_legacy_response(_Tokenizer(), torch.tensor([7, 2])) == "reasoning \\boxed{1}<eos>"
+    assert decode_legacy_response(_Tokenizer(), torch.tensor([7, 2])) == "reasoning</think> \\boxed{1}<eos>"
+
+
+@pytest.mark.parametrize(
+    "module_path, solution",
+    [
+        ("pkg://verl.experimental.hpt.reward_origin", "reasoning \\boxed{1}<eos>"),
+        ("pkg://verl.experimental.hpt.reward", "reasoning</think> \\boxed{1}<eos>"),
+    ],
+)
+def test_reward_manager_dispatches_origin_and_current_interfaces(module_path, solution):
+    assert (
+        _compute_configured_score_in_process(
+            module_path,
+            "compute_score",
+            {},
+            data_source="math",
+            solution_str=solution,
+            ground_truth="1",
+            extra_info={"response_length": 10},
+            max_response_length=10,
+        )
+        == 1.0
+    )
 
 
 def test_hpt_reward_is_compatible_with_async_reward_loop_thread_pool():
     # RewardManagerBase.run_single dispatches synchronous scorers through
     # run_in_executor; legacy SIGALRM guards must not make that path unusable.
     with ThreadPoolExecutor(max_workers=1) as executor:
-        result = executor.submit(compute_hpt_reward, "math", "reasoning \\boxed{1}<eos>", "1").result()
+        result = executor.submit(compute_hpt_reward, "math", "reasoning</think>\\boxed{1}<eos>", "1").result()
     assert result == 1.0
 
 
@@ -624,8 +648,8 @@ def test_hpt_reward_math_verify_fallback_matches_legacy_in_process_pool():
     # exercises entropy_math's math_verify fallback. math_verify's positive
     # timeout uses SIGALRM and otherwise fails closed in reward-loop threads.
     cases = [
-        (r"reasoning \boxed{524288}<eos>", r"2^{19}"),
-        (r"reasoning \boxed{3x+5y+3z=-10}<eos>", r"3x+5y+3z+10=0"),
+        (r"reasoning</think>\boxed{524288}<eos>", r"2^{19}"),
+        (r"reasoning</think>\boxed{3x+5y+3z=-10}<eos>", r"3x+5y+3z+10=0"),
     ]
     expected = [compute_hpt_reward("math", solution, ground_truth) for solution, ground_truth in cases]
     import multiprocessing as mp
@@ -1069,6 +1093,26 @@ def test_switch_matches_legacy_post_selector_order_before_padding():
     assert metrics["on_off_metrics/on_score"] == 0.5
     assert metrics["on_off_metrics/off_score"] == 1.0
     assert np.isclose(metrics["on_off_metrics/off_example_ratio"], 1 / 3)
+
+
+def test_apply_hpt_uses_the_configured_reward_interface_for_targets():
+    reward = torch.zeros(4, 3)
+
+    def configured_score(**kwargs):
+        assert kwargs["ground_truth"] == "1"
+        return 0.25
+
+    output, output_reward, _ = apply_hpt(
+        _batch(),
+        reward,
+        _Tokenizer(),
+        {"strategy": "switch", "switch_gate": 0},
+        dp_size=2,
+        compute_score=configured_score,
+    )
+
+    assert output.batch["hpt_sft_mask"].tolist() == [True, True]
+    assert output_reward.sum(dim=-1).tolist() == [0.25, 0.25]
 
 
 def test_luffy_passk0_keeps_failed_rollouts_and_appends_target():

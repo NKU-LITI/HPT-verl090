@@ -183,6 +183,7 @@ def apply_hpt(
     tokenizer,
     config: DictConfig | dict,
     dp_size: int,
+    compute_score=compute_hpt_reward,
 ) -> tuple[DataProto, torch.Tensor, dict[str, float]]:
     """Apply HPT routing after verification and before old-log-prob inference.
 
@@ -300,7 +301,7 @@ def apply_hpt(
             and valid_response_length > 0
             and int(valid_response_ids[-1].item()) == eos_token_id
         )
-        target_reward = compute_hpt_reward(
+        target_reward = compute_score(
             data_source=selected.non_tensor_batch["data_source"][row],
             solution_str=decoded_response,
             ground_truth=reward_model["ground_truth"],

@@ -10,13 +10,24 @@
 
 from __future__ import annotations
 
-from .answer_rules import choice_letters, parse_choice, split_label, split_top_level, strip_unit
-from .legacy_entropy_math import compute_score as legacy_entropy_math_score
-from .legacy_entropy_math import extract_answer
+if __package__:
+    from .answer_rules import choice_letters, parse_choice, split_label, split_top_level, strip_unit
+    from .legacy_entropy_math import compute_score as legacy_entropy_math_score
+    from .legacy_entropy_math import extract_answer
+else:  # Support the legacy file-path loader as well as pkg:// imports.
+    from verl.experimental.hpt.answer_rules import (
+        choice_letters,
+        parse_choice,
+        split_label,
+        split_top_level,
+        strip_unit,
+    )
+    from verl.experimental.hpt.legacy_entropy_math import compute_score as legacy_entropy_math_score
+    from verl.experimental.hpt.legacy_entropy_math import extract_answer
 
 THINK_END = "</think>"
-DEFAULT_MAX_RESPONSE_LENGTH = 8192
-# Key filled by ``LegacyHPTRewardManager`` with the valid response token count.
+# Kept as a public compatibility key for reward managers and rollout tools.
+# The current scorer deliberately does not reject a response by token length.
 RESPONSE_LENGTH_KEY = "response_length"
 
 
@@ -93,22 +104,10 @@ def compute_score(
     solution_str,
     ground_truth,
     extra_info=None,
-    max_response_length: int = DEFAULT_MAX_RESPONSE_LENGTH,
     **kwargs,
 ) -> float:
-    """Grade the last box after ``</think>``.
-
-    A response whose token length reaches ``max_response_length`` is treated as
-    unfinished and scored 0. The token length must be supplied in
-    ``extra_info["response_length"]`` (see ``reward_manager_origin.py``).
-    """
-    del data_source, kwargs
-    if not extra_info or extra_info.get(RESPONSE_LENGTH_KEY) is None:
-        raise ValueError(
-            f"extra_info[{RESPONSE_LENGTH_KEY!r}] is required; use LegacyHPTRewardManager"
-        )
-    if int(extra_info[RESPONSE_LENGTH_KEY]) >= max_response_length:
-        return 0.0
+    """Grade the last box after ``</think>``."""
+    del data_source, extra_info, kwargs
     final = final_response(solution_str)
     if final is None:
         return 0.0

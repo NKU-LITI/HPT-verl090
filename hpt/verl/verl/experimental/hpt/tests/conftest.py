@@ -26,5 +26,10 @@ def reward():
 
 
 @pytest.fixture(scope="session")
+def origin_reward():
+    return importlib.import_module(f"{PACKAGE}.reward_origin")
+
+
+@pytest.fixture(scope="session")
 def legacy():
     return importlib.import_module(f"{PACKAGE}.legacy_entropy_math")

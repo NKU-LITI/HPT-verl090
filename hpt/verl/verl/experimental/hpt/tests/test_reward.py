@@ -26,17 +26,28 @@ def test_extraction(reward, solution, gt, expected):
     assert score(reward, solution, gt) == expected
 
 
-def test_length_limit(reward):
+def test_length_metadata_is_backward_compatible_but_not_required(reward):
     solution = "t</think>\\boxed{3}"
     assert score(reward, solution, "3", {"response_length": 8191}) == 1.0
-    assert score(reward, solution, "3", {"response_length": 8192}) == 0.0
-    assert score(reward, solution, "3", {"response_length": 4096}, max_response_length=4096) == 0.0
+    assert score(reward, solution, "3", {"response_length": 8192}) == 1.0
+    assert score(reward, solution, "3", {"response_length": 4096}, max_response_length=4096) == 1.0
+    assert score(reward, solution, "3", None) == 1.0
 
 
-@pytest.mark.parametrize("extra_info", [None, {}])
-def test_missing_length_raises(reward, extra_info):
-    with pytest.raises(ValueError):
-        score(reward, "t</think>\\boxed{3}", "3", extra_info)
+def test_origin_and_current_reward_interfaces(origin_reward, reward):
+    plain = "reasoning \\boxed{3}"
+    tagged = "reasoning</think>\\boxed{3}"
+    kwargs = {"extra_info": {"response_length": 10}, "max_response_length": 10}
+
+    # Origin grades the last box anywhere; current only grades the final answer.
+    assert origin_reward.compute_score("test", plain, "3", **kwargs) == 1.0
+    assert reward.compute_score("test", plain, "3", **kwargs) == 0.0
+    assert origin_reward.compute_score("test", tagged, "3", **kwargs) == 1.0
+    assert reward.compute_score("test", tagged, "3", **kwargs) == 1.0
+
+    # Both process-pool entry points accept the same manager call contract.
+    assert origin_reward.compute_score_in_process("test", tagged, "3", **kwargs) == 1.0
+    assert reward.compute_score_in_process("test", tagged, "3", **kwargs) == 1.0
 
 
 # Single-field answers without units or labels must keep the legacy verdict.

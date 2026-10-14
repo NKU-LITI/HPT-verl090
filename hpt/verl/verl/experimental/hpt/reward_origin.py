@@ -10,7 +10,10 @@
 
 from __future__ import annotations
 
-from verl.experimental.hpt.legacy_entropy_math import compute_score as legacy_entropy_math_score
+if __package__:
+    from .legacy_entropy_math import compute_score as legacy_entropy_math_score
+else:  # Support the legacy file-path loader as well as pkg:// imports.
+    from verl.experimental.hpt.legacy_entropy_math import compute_score as legacy_entropy_math_score
 
 
 def legacy_reward_input(solution_str: str) -> str:
@@ -24,6 +27,6 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     return float(bool(legacy_entropy_math_score(legacy_reward_input(solution_str), ground_truth)))
 
 
-def compute_score_in_process(data_source, solution_str, ground_truth) -> float:
+def compute_score_in_process(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
     """Pickle-stable entry point used by the legacy reward process pool."""
-    return compute_score(data_source, solution_str, ground_truth)
+    return compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
